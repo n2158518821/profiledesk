@@ -2,7 +2,7 @@
 
 ProfileDesk 是一个面向 Windows 与 macOS 的本地多账户隔离浏览器工作台。每个账户使用独立的 Chromium Session 目录，Cookie、缓存、登录状态、站点存储、下载目录和代理配置互不共享。
 
-当前版本：`0.2.5`
+当前版本：`0.2.6`
 
 ## 已实现
 
@@ -82,6 +82,34 @@ npm run dist:mac
 按电脑架构下载其中一个即可，不需要同时下载两套。
 
 macOS正式分发需要Apple Developer证书与公证配置；Windows正式分发建议配置代码签名证书。未签名开发包会触发系统安全提醒。
+
+macOS构建会自动区分两种模式：
+
+- 未配置Developer ID证书：生成无签名开发包，并关闭Hardened Runtime，避免Apple Silicon上“无签名但启用强化运行时”导致应用无法启动。此包只适合自己测试，首次打开仍需在“系统设置 → 隐私与安全性”中选择“仍要打开”。
+- 配置Developer ID证书及公证凭据：保持Hardened Runtime，自动签名并提交Apple公证，适合向其他用户分发。
+
+GitHub Actions正式签名需要在仓库`Settings → Secrets and variables → Actions`中配置：
+
+- `MAC_CSC_LINK`：从钥匙串导出的Developer ID Application `.p12`文件的Base64内容。
+- `MAC_CSC_KEY_PASSWORD`：导出`.p12`时设置的密码。
+- `APPLE_ID`：Apple Developer账号。
+- `APPLE_APP_SPECIFIC_PASSWORD`：Apple ID生成的App专用密码。
+- `APPLE_TEAM_ID`：Apple Developer团队ID。
+
+如果这些Secrets为空，工作流仍会成功生成开发包，但不会把它显示成Apple已验证的软件。
+
+### macOS提示“已损坏”时
+
+先确认下载的是自己GitHub仓库构建的Artifact，并将`ProfileDesk.app`从DMG拖入“应用程序”。尝试打开一次后，进入“系统设置 → 隐私与安全性”，找到ProfileDesk并点“仍要打开”。如果没有这个按钮，可在终端对已确认可信的本机副本执行：
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/ProfileDesk.app"
+codesign --force --deep --sign - "/Applications/ProfileDesk.app"
+codesign --verify --deep --strict --verbose=2 "/Applications/ProfileDesk.app"
+open "/Applications/ProfileDesk.app"
+```
+
+如果前两条提示权限不足，再只给对应命令加`sudo`。不要对来源不明的软件执行移除隔离或临时签名命令。
 
 也可以推送到GitHub后运行仓库自带的双平台构建工作流。
 

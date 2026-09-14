@@ -1,6 +1,6 @@
 {
   "name": "profiledesk",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Cross-platform account-isolated browser workspace for Windows and macOS",
   "main": "src/main/main.js",
   "type": "commonjs",
@@ -15,8 +15,8 @@
     "pack": "electron-builder --dir",
     "dist:win": "electron-builder --win nsis portable --x64 --publish never",
     "dist:mac": "npm run dist:mac:x64 && npm run dist:mac:arm64",
-    "dist:mac:x64": "electron-builder --mac dmg --x64 --publish never",
-    "dist:mac:arm64": "electron-builder --mac dmg --arm64 --publish never"
+    "dist:mac:x64": "node scripts/build-mac.js x64",
+    "dist:mac:arm64": "node scripts/build-mac.js arm64"
   },
   "allowScripts": {
     "electron-winstaller@5.4.0": true
@@ -44,6 +44,7 @@
       "target": ["dmg"],
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
+      "notarize": true,
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist"
     },
