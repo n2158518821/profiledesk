@@ -1,0 +1,8 @@
+node_modules/
+release/
+dist/
+coverage/
+*.log
+*.pdesk
+.DS_Store
+Thumbs.db

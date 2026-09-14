@@ -1,0 +1,57 @@
+{
+  "name": "profiledesk",
+  "version": "0.2.0",
+  "description": "Cross-platform account-isolated browser workspace for Windows and macOS",
+  "main": "src/main/main.js",
+  "type": "commonjs",
+  "author": "ProfileDesk Contributors",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "test": "node --test",
+    "lint": "node scripts/check.js",
+    "verify": "npm run lint && npm test",
+    "pack": "electron-builder --dir",
+    "dist:win": "electron-builder --win nsis portable --x64",
+    "dist:mac": "electron-builder --mac dmg zip --x64 --arm64"
+  },
+  "devDependencies": {
+    "electron": "44.3.0",
+    "electron-builder": "26.0.12"
+  },
+  "build": {
+    "appId": "com.profiledesk.app",
+    "productName": "ProfileDesk",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json",
+      "README.md",
+      "LICENSE"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": ["dmg", "zip"],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "win": {
+      "target": ["nsis", "portable"]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
