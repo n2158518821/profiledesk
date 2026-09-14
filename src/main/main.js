@@ -17,6 +17,8 @@ const { SnapshotService } = require('./snapshot-service');
 const { decryptPackage, encryptPackage } = require('./crypto-package');
 const { runDiagnostics } = require('./diagnostics');
 const { SettingsService } = require('./settings-service');
+const { AuditLogger } = require('./audit-logger');
+const { DataDirectoryService } = require('./data-directory-service');
 
 app.commandLine.appendSwitch('force-webrtc-ip-handling-policy', 'disable_non_proxied_udp');
 
@@ -26,12 +28,64 @@ let vault;
 let profiles;
 let snapshots;
 let settings;
+let audit;
+let dataDirectories;
+let rootDir;
 let isUnlocked = true;
 let shuttingDown = false;
 let restoreSave = Promise.resolve();
 let restoreSessionsStarted = false;
 let unlockFailures = 0;
 let unlockBlockedUntil = 0;
+
+function publicAppSettings() {
+  return {
+    ...settings.publicSettings(),
+    dataDirectory: rootDir,
+    logDirectory: audit?.directory || path.join(rootDir, 'logs'),
+  };
+}
+
+function logAction(action, details = {}) {
+  return audit?.log(action, details).catch((error) => console.error('Audit log error:', error.message));
+}
+
+function relaunchSoon() {
+  shuttingDown = true;
+  setTimeout(() => {
+    app.relaunch();
+    app.exit(0);
+  }, 350);
+}
+
+async function deleteAccounts(ids) {
+  const selected = [...new Set(Array.isArray(ids) ? ids.map(String) : [])].slice(0, 500);
+  const accounts = selected.map((id) => store.findAccount(id)).filter(Boolean);
+  if (!accounts.length) throw new Error('没有可删除的账户');
+  const answer = await dialog.showMessageBox(mainWindow, {
+    type: 'warning',
+    title: '删除隔离账户',
+    message: `确定删除 ${accounts.length} 个账户？`,
+    detail: '将停止这些账户，并删除 Cookie、缓存、站点数据、下载目录、快照和已保存凭据。此操作不可撤销。',
+    buttons: ['删除账户', '取消'],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (answer.response !== 0) return { canceled: true, count: 0 };
+  for (const account of accounts) await profiles.removeAccountData(account.id);
+  const snapshotCount = await snapshots.removeForAccounts(selected);
+  await vault.removeMany(accounts.flatMap((account) => [account.proxy?.secretRef, account.autoLogin?.secretRef]));
+  await store.removeAccounts(selected);
+  await logAction('accounts.deleted', {
+    count: accounts.length,
+    accountIds: accounts.map((account) => account.id),
+    accountNames: accounts.map((account) => account.name),
+    snapshotCount,
+  });
+  send('workspace:changed', store.publicState());
+  return { canceled: false, count: accounts.length };
+}
 
 function send(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
@@ -90,7 +144,9 @@ async function restorePreviousSessions() {
   if (!isUnlocked || restoreSessionsStarted) return;
   restoreSessionsStarted = true;
   send('workspace:changed', store.publicState());
-  const restoreIds = store.data.restoreIds.filter((id) => store.findAccount(id)).slice(0, 20);
+  const restoreIds = store.data.restoreIds
+    .filter((id) => store.findAccount(id))
+    .slice(0, settings.publicSettings().maxRunningAccounts);
   let restoreCursor = 0;
   const restoreWorker = async () => {
     while (restoreCursor < restoreIds.length) {
@@ -133,7 +189,7 @@ function createMainWindow() {
       const restoreIds = isUnlocked ? [...profiles.instances.keys()] : store.data.restoreIds;
       restoreSave.catch(() => {})
         .then(() => store.setRestoreIds(restoreIds))
-        .then(() => profiles.stopAll())
+        .then(() => profiles.shutdown())
         .finally(() => mainWindow.close());
     }
   });
@@ -148,10 +204,10 @@ function registerIpc() {
 
   ipcMain.handle('app:get-bootstrap', () => ({
     locked: !isUnlocked,
-    settings: settings.publicSettings(),
+    settings: publicAppSettings(),
   }));
   ipcMain.handle('app:unlock', async (_event, password) => {
-    if (isUnlocked) return { state: store.publicState(), settings: settings.publicSettings() };
+    if (isUnlocked) return { state: store.publicState(), settings: publicAppSettings() };
     const now = Date.now();
     if (now < unlockBlockedUntil) {
       throw new Error(`密码错误次数过多，请在${Math.ceil((unlockBlockedUntil - now) / 1000)}秒后重试`);
@@ -167,28 +223,104 @@ function registerIpc() {
     unlockFailures = 0;
     unlockBlockedUntil = 0;
     isUnlocked = true;
+    await logAction('app.unlocked');
     restorePreviousSessions().catch(() => {});
-    return { state: store.publicState(), settings: settings.publicSettings() };
+    return { state: store.publicState(), settings: publicAppSettings() };
   });
   handleUnlocked('app:update-settings', async (_event, input) => {
-    const result = await settings.update(assertObject(input));
+    const safeInput = assertObject(input);
+    const result = await settings.update(safeInput);
+    await profiles.updateResourceLimits(result);
     const unavailableShortcuts = registerGlobalShortcuts();
-    return { settings: result, unavailableShortcuts };
+    let relaunching = false;
+    if (safeInput.dataBaseDirectory) {
+      const targetRoot = dataDirectories.targetForBase(safeInput.dataBaseDirectory);
+      const answer = await dialog.showMessageBox(mainWindow, {
+        type: 'question',
+        title: '迁移数据目录',
+        message: '迁移全部本地数据并重启 ProfileDesk？',
+        detail: `目标目录：${targetRoot}\n迁移期间请勿关闭软件。完成后旧目录会被尽力覆盖并删除。`,
+        buttons: ['迁移并重启', '取消迁移'],
+        defaultId: 1,
+        cancelId: 1,
+        noLink: true,
+      });
+      if (answer.response === 0) {
+        const migration = await dataDirectories.scheduleMigration(rootDir, safeInput.dataBaseDirectory);
+        relaunching = migration.changed;
+        if (relaunching) {
+          await logAction('data.migration_scheduled', { from: rootDir, to: targetRoot });
+          await profiles.shutdown();
+        }
+      }
+    }
+    await logAction('settings.updated', {
+      launchPasswordEnabled: result.launchPasswordEnabled,
+      maxRunningAccounts: result.maxRunningAccounts,
+      idleStopMinutes: result.idleStopMinutes,
+      memoryLimitMb: result.memoryLimitMb,
+      relaunching,
+    });
+    if (relaunching) relaunchSoon();
+    return { settings: publicAppSettings(), unavailableShortcuts, relaunching };
+  });
+  handleUnlocked('app:select-data-directory', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: '选择 ProfileDesk 数据存放位置',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (result.canceled || !result.filePaths[0]) return { canceled: true };
+    return {
+      canceled: false,
+      baseDirectory: result.filePaths[0],
+      dataDirectory: dataDirectories.targetForBase(result.filePaths[0]),
+    };
+  });
+  handleUnlocked('app:open-log-directory', async () => {
+    await fs.promises.mkdir(audit.directory, { recursive: true });
+    const error = await shell.openPath(audit.directory);
+    if (error) throw new Error(error);
+    return true;
+  });
+  handleUnlocked('app:wipe-all-data', async (_event, input) => {
+    const safeInput = assertObject(input);
+    if (!settings.isLockedOnLaunch()) throw new Error('必须先设置并保存启动密码');
+    if (!settings.verifyPassword(safeInput.password)) throw new Error('启动密码不正确');
+    if (safeInput.confirmation !== '永久删除全部数据') throw new Error('确认文字不正确');
+    const answer = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      title: '永久删除全部数据',
+      message: '最后确认：删除 ProfileDesk 的全部本地数据？',
+      detail: '所有账户、登录状态、缓存、快照、下载记录、已保存密码、设置和本地日志都将删除。软件随后重启为空白状态。',
+      buttons: ['永久删除并重启', '取消'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (answer.response !== 0) return { canceled: true };
+    await dataDirectories.scheduleWipe(rootDir);
+    await logAction('data.wipe_scheduled', { rootDir });
+    await profiles.shutdown();
+    relaunchSoon();
+    return { canceled: false, scheduled: true };
   });
 
   handleUnlocked('workspace:get-state', () => store.publicState());
   handleUnlocked('workspace:add-site', async (_event, input) => {
     const result = await store.addSite(assertObject(input));
+    await logAction('site.added', { siteId: result.id, name: result.name });
     send('workspace:changed', store.publicState());
     return result;
   });
   handleUnlocked('workspace:add-account', async (_event, input) => {
     const result = await store.addAccount(assertObject(input));
+    await logAction('account.added', { accountId: result.id, name: result.name, siteId: result.siteId });
     send('workspace:changed', store.publicState());
     return result;
   });
   handleUnlocked('workspace:import-batch', async (_event, rows) => {
     const result = await store.importBatch(rows);
+    await logAction('workspace.batch_imported', { sitesAdded: result.sitesAdded, accountsAdded: result.accountsAdded });
     send('workspace:changed', store.publicState());
     return result;
   });
@@ -215,9 +347,11 @@ function registerIpc() {
       delete safePatch.proxyPassword;
     }
     const result = await store.updateAccount(id, safePatch);
+    await logAction('account.updated', { accountId: id, fields: Object.keys(safePatch).filter((key) => !key.toLowerCase().includes('password')) });
     send('workspace:changed', store.publicState());
     return result;
   });
+  handleUnlocked('workspace:delete-accounts', (_event, ids) => deleteAccounts(ids));
 
   handleUnlocked('browser:start', (_event, id, options) => profiles.start(id, options));
   handleUnlocked('browser:stop', (_event, id) => profiles.stop(id));
@@ -227,13 +361,16 @@ function registerIpc() {
   handleUnlocked('browser:set-bounds', (_event, bounds) => profiles.setBounds(assertObject(bounds)));
   handleUnlocked('browser:set-proxy', async (_event, id, proxy) => {
     const result = await profiles.applyProxy(id, proxy);
+    await logAction('account.proxy_changed', { accountId: id, mode: result.mode });
     send('workspace:changed', store.publicState());
     return result;
   });
   handleUnlocked('browser:clear', async (_event, id, mode) => {
     const raw = profiles.currentUrl(id) || store.findAccount(id)?.startUrl;
     const origin = raw ? new URL(raw).origin : '';
-    return profiles.clear(id, mode, origin);
+    const result = await profiles.clear(id, mode, origin);
+    await logAction('account.browser_data_cleared', { accountId: id, mode });
+    return result;
   });
 
   handleUnlocked('diagnostics:run', async (_event, id) => {
@@ -248,6 +385,7 @@ function registerIpc() {
     const account = store.findAccount(id);
     if (!account) throw new Error('账户不存在');
     const result = await snapshots.create(account, profiles.getSession(id), label);
+    await logAction('snapshot.created', { accountId: id, snapshotId: result.id, label: result.label });
     send('workspace:changed', store.publicState());
     return result;
   });
@@ -263,6 +401,7 @@ function registerIpc() {
       proxy: payload.account.proxy,
       environment: payload.account.environment,
     });
+    await logAction('snapshot.restored', { accountId: account.id, snapshotId });
     send('workspace:changed', store.publicState());
     return true;
   });
@@ -291,6 +430,12 @@ function registerIpc() {
       }
     };
     await Promise.all(Array.from({ length: Math.min(3, queue.length) }, worker));
+    await logAction('accounts.bulk_action', {
+      action,
+      requested: queue.length,
+      succeeded: results.filter((item) => item.ok).length,
+      failed: results.filter((item) => !item.ok).length,
+    });
     send('workspace:changed', store.publicState());
     return results;
   });
@@ -319,6 +464,7 @@ function registerIpc() {
     });
     if (result.canceled || !result.filePath) return { canceled: true };
     await fs.promises.writeFile(result.filePath, encryptPackage(payload, password), { mode: 0o600 });
+    await logAction('package.exported', { count: accounts.length, fileName: path.basename(result.filePath) });
     return { canceled: false, filePath: result.filePath, count: accounts.length };
   });
 
@@ -373,17 +519,21 @@ function registerIpc() {
       count += 1;
     }
     send('workspace:changed', store.publicState());
+    await logAction('package.imported', { count, fileName: path.basename(importFile) });
     return { canceled: false, count };
   });
 }
 
 app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
-  const rootDir = path.join(app.getPath('userData'), 'workspace');
+  dataDirectories = new DataDirectoryService(app.getPath('userData'));
+  rootDir = await dataDirectories.init();
   store = new WorkspaceStore(rootDir);
   vault = new SecretVault(rootDir, safeStorage);
   settings = new SettingsService(rootDir);
-  await Promise.all([store.init(), vault.init(), settings.init()]);
+  audit = new AuditLogger(rootDir);
+  await Promise.all([store.init(), vault.init(), settings.init(), audit.init()]);
+  await logAction('app.started', { version: app.getVersion(), dataDirectory: rootDir });
   isUnlocked = !settings.isLockedOnLaunch();
   createMainWindow();
   profiles = new ProfileManager({
@@ -396,6 +546,9 @@ app.whenReady().then(async () => {
       if (['started', 'stopped', 'crashed', 'navigation'].includes(event.type)) {
         send('workspace:changed', store.publicState());
       }
+      if (['started', 'stopped', 'crashed', 'resource-released'].includes(event.type)) {
+        logAction(`browser.${event.type}`, { accountId: event.accountId, reason: event.reason || '' });
+      }
       if (!shuttingDown && ['started', 'stopped', 'crashed'].includes(event.type)) {
         const ids = [...profiles.instances.keys()];
         restoreSave = restoreSave.catch(() => {}).then(() => store.setRestoreIds(ids));
@@ -403,6 +556,7 @@ app.whenReady().then(async () => {
     },
   });
   await profiles.init();
+  await profiles.updateResourceLimits(settings.publicSettings());
   snapshots = new SnapshotService(rootDir, store, vault);
   await snapshots.init();
   registerIpc();

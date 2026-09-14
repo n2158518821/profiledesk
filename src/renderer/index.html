@@ -31,6 +31,7 @@
             <option value="reload">批量刷新</option>
             <option value="clear-cache">批量清缓存</option>
             <option value="snapshot">批量快照</option>
+            <option value="delete">批量删除</option>
           </select>
           <button id="run-bulk">执行</button>
         </div>
@@ -123,6 +124,21 @@
         <header><strong>选择状态快照</strong><button type="button" data-close-dialog>×</button></header>
         <div id="snapshot-list" class="snapshot-list"></div>
         <footer><button type="button" data-close-dialog>关闭</button><button id="snapshot-create-new" type="button" class="primary">创建新快照</button></footer>
+      </form>
+    </dialog>
+
+    <dialog id="wipe-dialog" class="danger-dialog">
+      <form id="wipe-form">
+        <header><strong>永久删除全部本地数据</strong><button type="button" data-close-dialog>×</button></header>
+        <div class="danger-content">
+          <p>此操作会关闭所有账户，并删除账户、Cookie、缓存、快照、下载记录、凭据、设置和日志。必须已经启用启动密码。</p>
+          <label for="wipe-password">当前启动密码</label>
+          <input id="wipe-password" type="password" autocomplete="current-password" required>
+          <label for="wipe-confirmation">输入“永久删除全部数据”确认</label>
+          <input id="wipe-confirmation" type="text" autocomplete="off" required>
+          <small>SSD、系统快照或备份可能保留底层副本，因此无法承诺法证级不可恢复。</small>
+        </div>
+        <footer><button type="button" data-close-dialog>取消</button><button class="danger-button">永久删除并重启</button></footer>
       </form>
     </dialog>
 

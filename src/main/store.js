@@ -150,6 +150,7 @@ class WorkspaceStore {
     const removed = this.data.accounts.filter((account) => selected.has(account.id));
     this.data.accounts = this.data.accounts.filter((account) => !selected.has(account.id));
     this.data.snapshots = this.data.snapshots.filter((item) => !selected.has(item.accountId));
+    this.data.restoreIds = this.data.restoreIds.filter((id) => !selected.has(id));
     await this.save();
     return removed;
   }

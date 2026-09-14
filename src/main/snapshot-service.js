@@ -68,6 +68,18 @@ class SnapshotService {
     await browserSession.flushStorageData();
     return payload;
   }
+
+  async removeForAccounts(accountIds) {
+    const selected = new Set(accountIds);
+    const items = this.store.data.snapshots.filter((item) => selected.has(item.accountId));
+    for (const item of items) {
+      const target = path.resolve(String(item.file || ''));
+      const relative = path.relative(this.rootDir, target);
+      if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) continue;
+      await fs.promises.rm(target, { force: true }).catch(() => {});
+    }
+    return items.length;
+  }
 }
 
 module.exports = { SnapshotService };

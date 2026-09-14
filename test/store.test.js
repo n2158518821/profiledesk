@@ -56,3 +56,18 @@ test('batch import supports site-only rows and account rows together', async (t)
   assert.equal(store.data.sites.length, 2);
   assert.equal(store.data.accounts.length, 1);
 });
+
+test('removing accounts also removes their snapshots and restore IDs', async (t) => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'profiledesk-remove-'));
+  t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+  const store = new WorkspaceStore(directory);
+  await store.init();
+  const site = await store.addSite({ name: 'Business', homeUrl: 'https://example.com' });
+  const account = await store.addAccount({ siteId: site.id, name: 'Delete me' });
+  store.data.snapshots.push({ id: 'snap', accountId: account.id });
+  await store.setRestoreIds([account.id]);
+  await store.removeAccounts([account.id]);
+  assert.equal(store.data.accounts.length, 0);
+  assert.equal(store.data.snapshots.length, 0);
+  assert.deepEqual(store.data.restoreIds, []);
+});

@@ -57,6 +57,16 @@ class SecretVault {
     delete this.data.secrets[ref];
     await this.save();
   }
+
+  async removeMany(refs) {
+    let changed = false;
+    for (const ref of new Set(Array.isArray(refs) ? refs : [])) {
+      if (!ref || !this.data.secrets[ref]) continue;
+      delete this.data.secrets[ref];
+      changed = true;
+    }
+    if (changed) await this.save();
+  }
 }
 
 module.exports = { SecretVault };

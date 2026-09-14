@@ -30,6 +30,11 @@ function normalizeShortcuts(value = {}) {
   return result;
 }
 
+function integerInRange(value, fallback, minimum, maximum) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
+}
+
 class SettingsService {
   constructor(rootDir) {
     this.file = path.join(rootDir, 'settings.json');
@@ -37,6 +42,9 @@ class SettingsService {
       version: 1,
       launchPassword: { enabled: false, salt: '', hash: '' },
       shortcuts: { ...DEFAULT_SHORTCUTS },
+      maxRunningAccounts: 8,
+      idleStopMinutes: 30,
+      memoryLimitMb: 4096,
     };
   }
 
@@ -51,6 +59,9 @@ class SettingsService {
           hash: String(parsed.launchPassword?.hash || ''),
         },
         shortcuts: normalizeShortcuts(parsed.shortcuts),
+        maxRunningAccounts: integerInRange(parsed.maxRunningAccounts, 8, 1, 30),
+        idleStopMinutes: integerInRange(parsed.idleStopMinutes, 30, 0, 1440),
+        memoryLimitMb: integerInRange(parsed.memoryLimitMb, 4096, 1024, 32768),
       };
     } catch (error) {
       if (error.code !== 'ENOENT') {
@@ -87,6 +98,9 @@ class SettingsService {
     return {
       launchPasswordEnabled: this.data.launchPassword.enabled,
       shortcuts: { ...this.data.shortcuts },
+      maxRunningAccounts: this.data.maxRunningAccounts,
+      idleStopMinutes: this.data.idleStopMinutes,
+      memoryLimitMb: this.data.memoryLimitMb,
     };
   }
 
@@ -110,6 +124,9 @@ class SettingsService {
       this.data.launchPassword = { enabled: false, salt: '', hash: '' };
     }
     this.data.shortcuts = shortcuts;
+    this.data.maxRunningAccounts = integerInRange(input.maxRunningAccounts, this.data.maxRunningAccounts, 1, 30);
+    this.data.idleStopMinutes = integerInRange(input.idleStopMinutes, this.data.idleStopMinutes, 0, 1440);
+    this.data.memoryLimitMb = integerInRange(input.memoryLimitMb, this.data.memoryLimitMb, 1024, 32768);
     await this.save();
     return this.publicSettings();
   }

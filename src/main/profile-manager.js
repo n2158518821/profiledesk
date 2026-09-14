@@ -18,9 +18,17 @@ class ProfileManager {
     this.profileRoot = path.join(rootDir, 'profiles');
     this.downloadRoot = path.join(rootDir, 'downloads');
     this.instances = new Map();
+    this.configuredSessions = new WeakSet();
     this.activeId = null;
     this.bounds = { x: 300, y: 110, width: 800, height: 500 };
     this.onEvent = onEvent;
+    this.maxRunningAccounts = 8;
+    this.idleStopMinutes = 30;
+    this.memoryLimitMb = 4096;
+    this.startQueue = Promise.resolve();
+    this.resourceTimer = null;
+    this.acceptingStarts = true;
+    this.blockedAccountIds = new Set();
     app.on('login', (event, webContents, _details, authInfo, callback) => {
       if (!authInfo.isProxy) return;
       const entry = [...this.instances.entries()]
@@ -38,10 +46,19 @@ class ProfileManager {
       fs.promises.mkdir(this.profileRoot, { recursive: true }),
       fs.promises.mkdir(this.downloadRoot, { recursive: true }),
     ]);
+    this.resourceTimer = setInterval(() => this.sweepResources().catch(() => {}), 60000);
+    this.resourceTimer.unref?.();
   }
 
   profilePath(accountId) {
-    return path.join(this.profileRoot, accountId);
+    return this.accountPath(this.profileRoot, accountId);
+  }
+
+  accountPath(parent, accountId) {
+    const target = path.resolve(parent, String(accountId || ''));
+    const relative = path.relative(parent, target);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('账户数据路径无效');
+    return target;
   }
 
   getSession(accountId) {
@@ -73,19 +90,15 @@ class ProfileManager {
   }
 
   configureSession(account, ses) {
-    const language = account.environment?.acceptLanguage;
-    if (language) {
-      ses.webRequest.onBeforeSendHeaders((details, callback) => {
-        details.requestHeaders['Accept-Language'] = language;
-        if (account.environment?.doNotTrack) details.requestHeaders.DNT = '1';
-        callback({ requestHeaders: details.requestHeaders });
-      });
-    } else if (account.environment?.doNotTrack) {
-      ses.webRequest.onBeforeSendHeaders((details, callback) => {
-        details.requestHeaders.DNT = '1';
-        callback({ requestHeaders: details.requestHeaders });
-      });
-    }
+    if (this.configuredSessions.has(ses)) return;
+    this.configuredSessions.add(ses);
+    ses.webRequest.onBeforeSendHeaders((details, callback) => {
+      const current = this.store.findAccount(account.id);
+      const language = current?.environment?.acceptLanguage;
+      if (language) details.requestHeaders['Accept-Language'] = language;
+      if (current?.environment?.doNotTrack) details.requestHeaders.DNT = '1';
+      callback({ requestHeaders: details.requestHeaders });
+    });
 
     ses.setPermissionCheckHandler((_webContents, permission) => {
       return !['media', 'geolocation', 'notifications', 'midiSysex', 'openExternal'].includes(permission);
@@ -94,7 +107,7 @@ class ProfileManager {
       callback(!['media', 'geolocation', 'notifications', 'midiSysex', 'openExternal'].includes(permission));
     });
 
-    const accountDownloadDir = path.join(this.downloadRoot, account.id);
+    const accountDownloadDir = this.accountPath(this.downloadRoot, account.id);
     fs.mkdirSync(accountDownloadDir, { recursive: true });
     ses.on('will-download', (_event, item) => {
       const target = path.join(accountDownloadDir, safeFileName(item.getFilename()));
@@ -103,7 +116,14 @@ class ProfileManager {
     });
   }
 
-  async start(accountId, options = {}) {
+  start(accountId, options = {}) {
+    if (!this.acceptingStarts || this.blockedAccountIds.has(accountId)) return Promise.reject(new Error('账户正在关闭或删除'));
+    const result = this.startQueue.then(() => this.startInternal(accountId, options));
+    this.startQueue = result.catch(() => {});
+    return result;
+  }
+
+  async startInternal(accountId, options = {}) {
     const running = this.instances.get(accountId);
     if (running) {
       if (options.activate !== false) this.activate(accountId);
@@ -111,6 +131,7 @@ class ProfileManager {
     }
     const account = this.store.findAccount(accountId);
     if (!account) throw new Error('账户不存在');
+    await this.enforceCapacity(accountId);
     const ses = session.fromPath(this.profilePath(accountId), { cache: true });
     this.configureSession(account, ses);
     await this.applyProxy(accountId, account.proxy);
@@ -130,6 +151,7 @@ class ProfileManager {
     view.setBounds(this.bounds);
     view.setVisible(false);
     const contents = view.webContents;
+    contents.setBackgroundThrottling(true);
     if (account.environment?.userAgent) contents.setUserAgent(account.environment.userAgent);
 
     contents.setWindowOpenHandler(({ url }) => {
@@ -148,14 +170,11 @@ class ProfileManager {
         this.emit('load-error', { accountId, code, description, url });
       }
     });
-    contents.on('render-process-gone', (_event, details) => {
-      this.store.updateAccount(accountId, { status: 'crashed', lastError: details.reason }).catch(() => {});
-      this.emit('crashed', { accountId, reason: details.reason });
-    });
+    contents.on('render-process-gone', (_event, details) => this.handleCrash(accountId, details).catch(() => {}));
     contents.on('did-finish-load', () => this.tryAutoFill(accountId).catch(() => {}));
 
     this.mainWindow.contentView.addChildView(view);
-    this.instances.set(accountId, { view, session: ses });
+    this.instances.set(accountId, { view, session: ses, lastActiveAt: Date.now() });
     await this.store.updateAccount(accountId, {
       status: 'running',
       lastOpenedAt: new Date().toISOString(),
@@ -212,7 +231,10 @@ class ProfileManager {
     if (!this.instances.has(accountId)) return false;
     for (const [id, instance] of this.instances) {
       instance.view.setVisible(id === accountId);
-      if (id === accountId) instance.view.setBounds(this.bounds);
+      if (id === accountId) {
+        instance.view.setBounds(this.bounds);
+        instance.lastActiveAt = Date.now();
+      }
     }
     this.activeId = accountId;
     this.emit('activated', { accountId });
@@ -233,9 +255,18 @@ class ProfileManager {
   async stop(accountId) {
     const instance = this.instances.get(accountId);
     if (!instance) return { accountId, status: 'stopped' };
+    await this.disposeInstance(accountId, true);
+    await this.store.updateAccount(accountId, { status: 'stopped' });
+    this.emit('stopped', { accountId });
+    return { accountId, status: 'stopped' };
+  }
+
+  async disposeInstance(accountId, flush) {
+    const instance = this.instances.get(accountId);
+    if (!instance) return;
     const wasActive = this.activeId === accountId;
     try {
-      const flushResult = instance.session.flushStorageData();
+      const flushResult = flush ? instance.session.flushStorageData() : null;
       if (flushResult && typeof flushResult.then === 'function') await flushResult;
     } catch {
       // Closing the isolated view remains safe even if Chromium cannot flush a damaged profile.
@@ -251,13 +282,102 @@ class ProfileManager {
       const nextId = this.instances.keys().next().value;
       if (nextId) this.activate(nextId);
     }
-    await this.store.updateAccount(accountId, { status: 'stopped' });
-    this.emit('stopped', { accountId });
-    return { accountId, status: 'stopped' };
   }
 
   async stopAll() {
     for (const id of [...this.instances.keys()]) await this.stop(id);
+  }
+
+  async handleCrash(accountId, details) {
+    await this.disposeInstance(accountId, false);
+    await this.store.updateAccount(accountId, { status: 'crashed', lastError: details.reason });
+    this.emit('crashed', { accountId, reason: details.reason });
+  }
+
+  updateResourceLimits({ maxRunningAccounts, idleStopMinutes, memoryLimitMb } = {}) {
+    this.maxRunningAccounts = Math.min(30, Math.max(1, Number.parseInt(maxRunningAccounts, 10) || 8));
+    this.idleStopMinutes = Math.min(1440, Math.max(0, Number.parseInt(idleStopMinutes, 10) || 0));
+    this.memoryLimitMb = Math.min(32768, Math.max(1024, Number.parseInt(memoryLimitMb, 10) || 4096));
+    return this.trimToLimit();
+  }
+
+  async enforceCapacity(incomingId) {
+    while (!this.instances.has(incomingId) && this.instances.size >= this.maxRunningAccounts) {
+      const candidate = [...this.instances.entries()]
+        .filter(([id]) => id !== incomingId)
+        .sort((left, right) => left[1].lastActiveAt - right[1].lastActiveAt)
+        .find(([id]) => id !== this.activeId) || [...this.instances.entries()][0];
+      if (!candidate) break;
+      await this.stop(candidate[0]);
+      this.emit('resource-released', { accountId: candidate[0], reason: 'limit' });
+    }
+  }
+
+  async trimToLimit() {
+    while (this.instances.size > this.maxRunningAccounts) {
+      const candidate = [...this.instances.entries()]
+        .sort((left, right) => left[1].lastActiveAt - right[1].lastActiveAt)
+        .find(([id]) => id !== this.activeId) || [...this.instances.entries()][0];
+      if (!candidate) break;
+      await this.stop(candidate[0]);
+      this.emit('resource-released', { accountId: candidate[0], reason: 'limit' });
+    }
+  }
+
+  async stopIdleInstances() {
+    if (!this.idleStopMinutes) return;
+    const cutoff = Date.now() - this.idleStopMinutes * 60 * 1000;
+    const idleIds = [...this.instances.entries()]
+      .filter(([id, instance]) => id !== this.activeId && instance.lastActiveAt < cutoff)
+      .map(([id]) => id);
+    for (const id of idleIds) {
+      await this.stop(id);
+      this.emit('resource-released', { accountId: id, reason: 'idle' });
+    }
+  }
+
+  workingSetMb() {
+    try {
+      const totalKb = app.getAppMetrics().reduce((total, metric) => total + Number(metric.memory?.workingSetSize || 0), 0);
+      return totalKb / 1024;
+    } catch {
+      return 0;
+    }
+  }
+
+  async releaseForMemoryPressure() {
+    const candidates = [...this.instances.entries()]
+      .filter(([id]) => id !== this.activeId)
+      .sort((left, right) => left[1].lastActiveAt - right[1].lastActiveAt)
+      .map(([id]) => id);
+    for (const id of candidates) {
+      if (this.workingSetMb() <= this.memoryLimitMb) break;
+      await this.stop(id);
+      this.emit('resource-released', { accountId: id, reason: 'memory' });
+    }
+  }
+
+  async sweepResources() {
+    await this.stopIdleInstances();
+    await this.releaseForMemoryPressure();
+  }
+
+  async removeAccountData(accountId) {
+    this.blockedAccountIds.add(accountId);
+    await this.startQueue.catch(() => {});
+    await this.stop(accountId);
+    await Promise.all([
+      fs.promises.rm(this.profilePath(accountId), { recursive: true, force: true }),
+      fs.promises.rm(this.accountPath(this.downloadRoot, accountId), { recursive: true, force: true }),
+    ]);
+  }
+
+  async shutdown() {
+    this.acceptingStarts = false;
+    await this.startQueue.catch(() => {});
+    if (this.resourceTimer) clearInterval(this.resourceTimer);
+    this.resourceTimer = null;
+    await this.stopAll();
   }
 
   async navigate(accountId, url) {

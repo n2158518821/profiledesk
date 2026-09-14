@@ -7,6 +7,11 @@ let editorSave = null;
 let toastTimer = null;
 let appSettings = {
   launchPasswordEnabled: false,
+  dataDirectory: '',
+  logDirectory: '',
+  maxRunningAccounts: 8,
+  idleStopMinutes: 30,
+  memoryLimitMb: 4096,
   shortcuts: {
     showHide: 'CommandOrControl+Shift+P',
     nextAccount: 'CommandOrControl+Shift+Right',
@@ -97,7 +102,7 @@ function renderTree() {
         <span class="account-avatar">${escapeHtml(initial(account.name))}</span>
         <span class="dot ${escapeHtml(account.status)}"></span>
         <div class="account-main"><strong>${escapeHtml(account.name)}</strong><span>${escapeHtml(account.username || account.startUrl)}</span></div>
-        <button class="launch" data-toggle-account="${account.id}" title="${account.status === 'running' ? '停止' : '启动'}">${account.status === 'running' ? '■' : '▶'}</button>
+        <button class="row-delete" data-delete-account="${account.id}" title="删除账户" aria-label="删除${escapeHtml(account.name)}">删</button>
       </div>`).join('')}</div>
     </section>`);
   }
@@ -256,6 +261,15 @@ function openAppSettings() {
     field('上一个账户', 'previousAccount', shortcuts.previousAccount),
     field('收起/展开侧栏', 'toggleSidebar', shortcuts.toggleSidebar),
     '<span></span><span class="hint">快捷键格式示例：CommandOrControl+Shift+P。账户切换只在已启动账户之间循环。</span>',
+    field('同时运行上限', 'maxRunningAccounts', appSettings.maxRunningAccounts || 8, 'number', 'min="1" max="30" required'),
+    field('闲置自动停止', 'idleStopMinutes', appSettings.idleStopMinutes ?? 30, 'number', 'min="0" max="1440" required'),
+    '<span></span><span class="hint">单位：分钟；0表示关闭。只停止非当前账户，释放隐藏浏览进程；超过运行上限时优先停止最久未使用账户。</span>',
+    field('内存软上限(MB)', 'memoryLimitMb', appSettings.memoryLimitMb || 4096, 'number', 'min="1024" max="32768" step="256" required'),
+    '<span></span><span class="hint">达到软上限时逐个停止最久未使用的后台账户；不会突然终止当前操作中的账户。</span>',
+    `<label for="field-dataDirectoryDisplay">数据文件目录</label><div class="path-row"><input id="field-dataDirectoryDisplay" value="${escapeHtml(appSettings.dataDirectory || '')}" readonly><button type="button" data-choose-data-directory>选择</button><input type="hidden" name="dataBaseDirectory" value=""></div>`,
+    `<label>本地操作日志</label><div class="path-row"><input value="${escapeHtml(appSettings.logDirectory || '')}" readonly><button type="button" data-open-log-directory>打开</button></div>`,
+    '<span></span><span class="hint">记录添加、删除、清理、快照、导入导出和设置变更；保留90天，单文件最多5MB，不记录密码内容。</span>',
+    '<label class="danger-zone">危险操作</label><div class="settings-action danger-zone"><button type="button" class="danger-button" data-open-wipe-dialog>清空并粉碎全部数据</button></div>',
   ].join(''), async (data) => {
     const next = Object.fromEntries(data);
     const result = await api.updateAppSettings({
@@ -268,13 +282,38 @@ function openAppSettings() {
         previousAccount: next.previousAccount,
         toggleSidebar: next.toggleSidebar,
       },
+      maxRunningAccounts: next.maxRunningAccounts,
+      idleStopMinutes: next.idleStopMinutes,
+      memoryLimitMb: next.memoryLimitMb,
+      dataBaseDirectory: next.dataBaseDirectory,
     });
     appSettings = result.settings;
+    if (result.relaunching) {
+      showToast('数据迁移已安排，软件即将重启');
+      return;
+    }
     if (result.unavailableShortcuts.length) {
       showToast(`设置已保存，但 ${result.unavailableShortcuts.map((item) => item.accelerator).join('、')} 已被系统占用`, true);
     } else {
       showToast('软件设置已保存');
     }
+  });
+  const fieldsRoot = $('#editor-fields');
+  fieldsRoot.querySelector('[data-choose-data-directory]').addEventListener('click', async () => {
+    const result = await act('正在选择数据目录…', () => api.selectDataDirectory());
+    if (result.canceled) return;
+    fieldsRoot.querySelector('#field-dataDirectoryDisplay').value = result.dataDirectory;
+    fieldsRoot.querySelector('[name="dataBaseDirectory"]').value = result.baseDirectory;
+  });
+  fieldsRoot.querySelector('[data-open-log-directory]').addEventListener('click', () => {
+    api.openLogDirectory().catch((error) => showToast(friendlyError(error), true));
+  });
+  fieldsRoot.querySelector('[data-open-wipe-dialog]').addEventListener('click', () => {
+    if (!appSettings.launchPasswordEnabled) return showToast('请先启用并保存启动密码', true);
+    closeDialog($('#editor-dialog'));
+    $('#wipe-dialog').showModal();
+    requestBrowserBounds();
+    $('#wipe-password').focus();
   });
 }
 
@@ -342,6 +381,14 @@ async function runBulk() {
   const ids = [...selectedIds];
   if (!ids.length) return showToast('请先勾选账户', true);
   const action = $('#bulk-action').value;
+  if (action === 'delete') {
+    const result = await act(`正在删除 ${ids.length} 个账户…`, () => api.deleteAccounts(ids));
+    if (!result.canceled) {
+      selectedIds.clear();
+      showToast(`已删除 ${result.count} 个账户及其本地数据`);
+    }
+    return;
+  }
   const results = await act(`正在执行 ${ids.length} 个账户…`, () => api.bulkRun(ids, action));
   const failures = results.filter((result) => !result.ok);
   showToast(failures.length ? `完成：成功${results.length - failures.length}，失败${failures.length}` : `已完成 ${results.length} 个账户`, Boolean(failures.length));
@@ -370,13 +417,13 @@ $('#account-tree').addEventListener('click', async (event) => {
     renderTree();
     return;
   }
-  const toggle = event.target.closest('[data-toggle-account]');
-  if (toggle) {
+  const deleteButton = event.target.closest('[data-delete-account]');
+  if (deleteButton) {
     event.stopPropagation();
-    const account = accountById(toggle.dataset.toggleAccount);
+    const account = accountById(deleteButton.dataset.deleteAccount);
     if (!account) return;
-    if (account.status === 'running') await act('正在停止…', () => api.stop(account.id));
-    else await activateAccount(account.id);
+    const result = await act(`正在删除 ${account.name}…`, () => api.deleteAccounts([account.id]));
+    if (!result.canceled) showToast('账户及其本地数据已删除');
     return;
   }
   if (event.target.matches('[data-select-account]')) return;
@@ -467,6 +514,25 @@ $('#batch-form').addEventListener('submit', async (event) => {
   }
 });
 
+$('#wipe-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    const result = await act('正在准备删除全部数据…', () => api.wipeAllData({
+      password: $('#wipe-password').value,
+      confirmation: $('#wipe-confirmation').value.trim(),
+    }));
+    if (result.canceled) return;
+    showToast('软件将重启并删除全部数据');
+  } catch {
+    $('#wipe-password').select();
+  }
+});
+
+$('#wipe-dialog').addEventListener('close', () => {
+  $('#wipe-password').value = '';
+  $('#wipe-confirmation').value = '';
+});
+
 document.addEventListener('click', (event) => {
   if (event.target.matches('[data-close-dialog]')) closeDialog(event.target.closest('dialog'));
   const id = event.target.dataset.restoreSnapshot;
@@ -508,6 +574,15 @@ api.onBrowserEvent((event) => {
     activeAccountId = event.accountId;
     renderTree();
     syncActiveUi();
+  }
+  if (event.type === 'resource-released') {
+    const messages = {
+      idle: '闲置账户已自动停止并释放资源',
+      memory: '内存达到软上限，已停止最久未使用的后台账户',
+      limit: '已停止最久未使用账户以控制资源占用',
+    };
+    showToast(messages[event.reason] || '后台账户已停止并释放资源');
+    return;
   }
   if (event.accountId !== activeAccountId) return;
   if (event.type === 'navigation') {
