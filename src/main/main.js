@@ -73,7 +73,12 @@ async function deleteAccounts(ids) {
     noLink: true,
   });
   if (answer.response !== 0) return { canceled: true, count: 0 };
-  for (const account of accounts) await profiles.removeAccountData(account.id);
+  const pendingPaths = [];
+  for (const account of accounts) {
+    const result = await profiles.removeAccountData(account.id);
+    pendingPaths.push(...result.pendingPaths);
+  }
+  if (pendingPaths.length) await dataDirectories.scheduleAccountDataRemoval(rootDir, pendingPaths);
   const snapshotCount = await snapshots.removeForAccounts(selected);
   await vault.removeMany(accounts.flatMap((account) => [account.proxy?.secretRef, account.autoLogin?.secretRef]));
   await store.removeAccounts(selected);
@@ -82,9 +87,19 @@ async function deleteAccounts(ids) {
     accountIds: accounts.map((account) => account.id),
     accountNames: accounts.map((account) => account.name),
     snapshotCount,
+    restartCleanupPaths: pendingPaths.length,
   });
   send('workspace:changed', store.publicState());
-  return { canceled: false, count: accounts.length };
+  const cleanupPending = pendingPaths.length > 0;
+  if (cleanupPending) {
+    const restoreIds = [...profiles.instances.keys()];
+    shuttingDown = true;
+    await restoreSave.catch(() => {});
+    await store.setRestoreIds(restoreIds);
+    await profiles.shutdown();
+    relaunchSoon();
+  }
+  return { canceled: false, count: accounts.length, cleanupPending };
 }
 
 function send(channel, payload) {

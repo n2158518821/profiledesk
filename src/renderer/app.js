@@ -385,7 +385,9 @@ async function runBulk() {
     const result = await act(`正在删除 ${ids.length} 个账户…`, () => api.deleteAccounts(ids));
     if (!result.canceled) {
       selectedIds.clear();
-      showToast(`已删除 ${result.count} 个账户及其本地数据`);
+      showToast(result.cleanupPending
+        ? `已删除 ${result.count} 个账户，软件将重启完成文件清理`
+        : `已删除 ${result.count} 个账户及其本地数据`);
     }
     return;
   }
@@ -423,7 +425,7 @@ $('#account-tree').addEventListener('click', async (event) => {
     const account = accountById(deleteButton.dataset.deleteAccount);
     if (!account) return;
     const result = await act(`正在删除 ${account.name}…`, () => api.deleteAccounts([account.id]));
-    if (!result.canceled) showToast('账户及其本地数据已删除');
+    if (!result.canceled) showToast(result.cleanupPending ? '账户已删除，软件将重启完成文件清理' : '账户及其本地数据已删除');
     return;
   }
   if (event.target.matches('[data-select-account]')) return;

@@ -56,3 +56,31 @@ test('wipe refuses a directory without the matching ownership marker', async (t)
   await assert.rejects(() => service.init());
   assert.equal(await fs.promises.readFile(path.join(unrelated, 'important.txt'), 'utf8'), 'keep');
 });
+
+test('pending account data is deleted before browser sessions start', async (t) => {
+  const parent = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'profiledesk-account-cleanup-'));
+  t.after(() => fs.promises.rm(parent, { recursive: true, force: true }));
+  const userData = path.join(parent, 'user-data');
+  const service = new DataDirectoryService(userData);
+  const root = await service.init();
+  const profile = path.join(root, 'profiles', 'account-id');
+  const download = path.join(root, 'downloads', 'account-id');
+  await fs.promises.mkdir(profile, { recursive: true });
+  await fs.promises.mkdir(download, { recursive: true });
+  await fs.promises.writeFile(path.join(profile, 'Cookies'), 'locked-before-restart');
+  await fs.promises.writeFile(path.join(download, 'file.txt'), 'download');
+  await service.scheduleAccountDataRemoval(root, [profile, download]);
+
+  const restarted = new DataDirectoryService(userData);
+  await restarted.init();
+  await assert.rejects(() => fs.promises.access(profile));
+  await assert.rejects(() => fs.promises.access(download));
+});
+
+test('pending account cleanup rejects paths outside profile and download roots', async (t) => {
+  const parent = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'profiledesk-account-cleanup-safety-'));
+  t.after(() => fs.promises.rm(parent, { recursive: true, force: true }));
+  const service = new DataDirectoryService(path.join(parent, 'user-data'));
+  const root = await service.init();
+  await assert.rejects(() => service.scheduleAccountDataRemoval(root, [path.join(parent, 'unrelated')]));
+});

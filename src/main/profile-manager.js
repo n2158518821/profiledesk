@@ -365,11 +365,23 @@ class ProfileManager {
   async removeAccountData(accountId) {
     this.blockedAccountIds.add(accountId);
     await this.startQueue.catch(() => {});
-    await this.stop(accountId);
+    const browserSession = this.getSession(accountId);
     await Promise.all([
-      fs.promises.rm(this.profilePath(accountId), { recursive: true, force: true }),
-      fs.promises.rm(this.accountPath(this.downloadRoot, accountId), { recursive: true, force: true }),
+      browserSession.clearCache().catch(() => {}),
+      browserSession.clearStorageData().catch(() => {}),
+      browserSession.closeAllConnections().catch(() => {}),
     ]);
+    await this.stop(accountId);
+    const targets = [this.profilePath(accountId), this.accountPath(this.downloadRoot, accountId)];
+    const pendingPaths = [];
+    for (const target of targets) {
+      try {
+        await fs.promises.rm(target, { recursive: true, force: true, maxRetries: 3, retryDelay: 150 });
+      } catch {
+        pendingPaths.push(target);
+      }
+    }
+    return { pendingPaths };
   }
 
   async shutdown() {

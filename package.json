@@ -1,6 +1,6 @@
 {
   "name": "profiledesk",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Cross-platform account-isolated browser workspace for Windows and macOS",
   "main": "src/main/main.js",
   "type": "commonjs",

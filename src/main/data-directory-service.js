@@ -91,6 +91,7 @@ class DataDirectoryService {
       pendingMigration: null,
       pendingWipe: '',
       cleanupRoots: [],
+      pendingDeletes: [],
     };
   }
 
@@ -105,6 +106,7 @@ class DataDirectoryService {
         pendingMigration: parsed.pendingMigration || null,
         pendingWipe: String(parsed.pendingWipe || ''),
         cleanupRoots: Array.isArray(parsed.cleanupRoots) ? parsed.cleanupRoots.map(String).slice(0, 10) : [],
+        pendingDeletes: Array.isArray(parsed.pendingDeletes) ? parsed.pendingDeletes.map(String).slice(0, 1000) : [],
       };
     } catch (error) {
       if (error.code !== 'ENOENT') {
@@ -150,6 +152,16 @@ class DataDirectoryService {
     return this.assertOwnedRoot(path.join(base, 'ProfileDeskData'));
   }
 
+  assertAccountDataPath(rootDir, target) {
+    const root = this.assertOwnedRoot(rootDir);
+    const resolved = path.resolve(String(target || ''));
+    const allowedParents = [path.join(root, 'profiles'), path.join(root, 'downloads')];
+    if (!allowedParents.some((parent) => samePath(path.dirname(resolved), parent))) {
+      throw new Error('待删除账户数据路径超出允许范围');
+    }
+    return resolved;
+  }
+
   async init() {
     await this.readLocator();
     await this.save();
@@ -163,6 +175,24 @@ class DataDirectoryService {
         await secureRemoveTree(wipeRoot);
       }
       this.data.pendingWipe = '';
+      this.data.pendingDeletes = [];
+      await this.save();
+    }
+
+    const mayInitializeCurrent = samePath(this.data.activeRoot, this.defaultRoot) || !await pathExists(this.data.activeRoot);
+    await this.ensureOwnership(this.data.activeRoot, mayInitializeCurrent);
+    if (this.data.pendingDeletes.length) {
+      const remaining = [];
+      for (const item of this.data.pendingDeletes) {
+        try {
+          const target = this.assertAccountDataPath(this.data.activeRoot, item);
+          await secureRemoveTree(target);
+          if (await pathExists(target)) remaining.push(target);
+        } catch {
+          remaining.push(item);
+        }
+      }
+      this.data.pendingDeletes = remaining;
       await this.save();
     }
 
@@ -226,6 +256,16 @@ class DataDirectoryService {
     await this.ensureOwnership(target);
     this.data.pendingWipe = target;
     await this.save();
+  }
+
+  async scheduleAccountDataRemoval(rootDir, paths) {
+    const root = this.assertOwnedRoot(rootDir);
+    if (!samePath(root, this.data.activeRoot)) throw new Error('只能登记当前数据目录中的账户文件');
+    await this.ensureOwnership(root);
+    const targets = (Array.isArray(paths) ? paths : []).map((item) => this.assertAccountDataPath(root, item));
+    this.data.pendingDeletes = [...new Set([...this.data.pendingDeletes, ...targets])].slice(0, 1000);
+    await this.save();
+    return targets.length;
   }
 }
 
