@@ -2,7 +2,7 @@
 
 ProfileDesk 是一个面向 Windows 与 macOS 的本地多账户隔离浏览器工作台。每个账户使用独立的 Chromium Session 目录，Cookie、缓存、登录状态、站点存储、下载目录和代理配置互不共享。
 
-当前版本：`0.2.0`
+当前版本：`0.2.2`
 
 ## 已实现
 
@@ -34,9 +34,13 @@ ProfileDesk保证本机浏览数据隔离，但不承诺不同账号无法被业
 ## 本地运行
 
 ```bash
-npm install
+npm install --allow-git=all
 npm start
 ```
+
+npm 12默认禁止Git来源依赖；Electron构建链包含固定到官方仓库提交的`@electron/node-gyp`，因此安装命令对本次依赖解析显式启用Git来源。Windows本地还需要安装Git for Windows。
+
+npm 12还会阻止未审批的依赖安装脚本。本项目只在`package.json`中批准固定版本的`electron-winstaller@5.4.0`，用于Windows安装包构建；不要使用全量脚本审批。
 
 无需管理员权限。首次启动会在系统应用数据目录创建配置、Profile、快照与下载目录。
 
@@ -67,6 +71,8 @@ npm run dist:mac
 macOS正式分发需要Apple Developer证书与公证配置；Windows正式分发建议配置代码签名证书。未签名开发包会触发系统安全提醒。
 
 也可以推送到GitHub后运行仓库自带的双平台构建工作流。
+
+构建脚本固定使用`--publish never`：GitHub Actions只生成并上传Artifact，不会因仓库中存在Draft Release而尝试自动发布。正式发布Release时应使用独立、明确授权的发布流程。
 
 Windows 本机不能完成可正常分发的 macOS 签名与公证；可以在 Windows 上把代码推送到 GitHub，然后由工作流的 Windows/macOS 构建机自动生成全部包。
 

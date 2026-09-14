@@ -9,8 +9,16 @@ if errorlevel 1 (
   exit /b 1
 )
 
+where git >nul 2>nul
+if errorlevel 1 (
+  echo Git for Windows is required because Electron contains a pinned official Git dependency.
+  echo Install it from https://git-scm.com/download/win first.
+  pause
+  exit /b 1
+)
+
 echo [1/3] Installing dependencies...
-call npm install
+call npm install --allow-git=all
 if errorlevel 1 goto :failed
 
 echo [2/3] Running checks...
