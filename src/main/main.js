@@ -1,0 +1,424 @@
+const fs = require('node:fs');
+const path = require('node:path');
+const {
+  app,
+  BrowserWindow,
+  dialog,
+  globalShortcut,
+  ipcMain,
+  Menu,
+  safeStorage,
+  shell,
+} = require('electron');
+const { WorkspaceStore } = require('./store');
+const { SecretVault } = require('./vault');
+const { ProfileManager } = require('./profile-manager');
+const { SnapshotService } = require('./snapshot-service');
+const { decryptPackage, encryptPackage } = require('./crypto-package');
+const { runDiagnostics } = require('./diagnostics');
+const { SettingsService } = require('./settings-service');
+
+app.commandLine.appendSwitch('force-webrtc-ip-handling-policy', 'disable_non_proxied_udp');
+
+let mainWindow;
+let store;
+let vault;
+let profiles;
+let snapshots;
+let settings;
+let isUnlocked = true;
+let shuttingDown = false;
+let restoreSave = Promise.resolve();
+let restoreSessionsStarted = false;
+let unlockFailures = 0;
+let unlockBlockedUntil = 0;
+
+function send(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
+}
+
+function assertObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('请求参数无效');
+  return value;
+}
+
+function ensureUnlocked() {
+  if (!isUnlocked) throw new Error('应用已锁定，请先输入启动密码');
+}
+
+function cycleRunningAccount(offset) {
+  if (!isUnlocked || !profiles) return;
+  const ids = store.data.accounts.map((account) => account.id).filter((id) => profiles.isRunning(id));
+  if (!ids.length) return;
+  const currentIndex = ids.indexOf(profiles.activeId);
+  const nextIndex = currentIndex === -1
+    ? (offset > 0 ? 0 : ids.length - 1)
+    : (currentIndex + offset + ids.length) % ids.length;
+  const nextId = ids[nextIndex];
+  profiles.activate(nextId);
+  if (!mainWindow.isVisible()) mainWindow.show();
+  mainWindow.focus();
+}
+
+function registerGlobalShortcuts() {
+  globalShortcut.unregisterAll();
+  const unavailable = [];
+  const shortcuts = settings.publicSettings().shortcuts;
+  const actions = {
+    showHide: () => {
+      if (mainWindow.isVisible() && mainWindow.isFocused()) mainWindow.hide();
+      else {
+        mainWindow.show();
+        mainWindow.focus();
+      }
+    },
+    nextAccount: () => cycleRunningAccount(1),
+    previousAccount: () => cycleRunningAccount(-1),
+    toggleSidebar: () => send('app:shortcut', { action: 'toggle-sidebar' }),
+  };
+  for (const [name, accelerator] of Object.entries(shortcuts)) {
+    try {
+      if (!globalShortcut.register(accelerator, actions[name])) unavailable.push({ name, accelerator });
+    } catch {
+      unavailable.push({ name, accelerator });
+    }
+  }
+  return unavailable;
+}
+
+async function restorePreviousSessions() {
+  if (!isUnlocked || restoreSessionsStarted) return;
+  restoreSessionsStarted = true;
+  send('workspace:changed', store.publicState());
+  const restoreIds = store.data.restoreIds.filter((id) => store.findAccount(id)).slice(0, 20);
+  let restoreCursor = 0;
+  const restoreWorker = async () => {
+    while (restoreCursor < restoreIds.length) {
+      const id = restoreIds[restoreCursor++];
+      await profiles.start(id, { activate: false }).catch(() => {});
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, restoreIds.length) }, restoreWorker));
+  if (restoreIds[0] && profiles.isRunning(restoreIds[0])) profiles.activate(restoreIds[0]);
+}
+
+function createMainWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1440,
+    height: 900,
+    minWidth: 980,
+    minHeight: 640,
+    resizable: true,
+    title: 'ProfileDesk',
+    backgroundColor: '#08101d',
+    show: false,
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, '..', 'preload', 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+    },
+  });
+  mainWindow.setMenuBarVisibility(false);
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  mainWindow.on('close', (event) => {
+    if (!shuttingDown && profiles) {
+      event.preventDefault();
+      shuttingDown = true;
+      const restoreIds = isUnlocked ? [...profiles.instances.keys()] : store.data.restoreIds;
+      restoreSave.catch(() => {})
+        .then(() => store.setRestoreIds(restoreIds))
+        .then(() => profiles.stopAll())
+        .finally(() => mainWindow.close());
+    }
+  });
+  return mainWindow;
+}
+
+function registerIpc() {
+  const handleUnlocked = (channel, handler) => ipcMain.handle(channel, (event, ...args) => {
+    ensureUnlocked();
+    return handler(event, ...args);
+  });
+
+  ipcMain.handle('app:get-bootstrap', () => ({
+    locked: !isUnlocked,
+    settings: settings.publicSettings(),
+  }));
+  ipcMain.handle('app:unlock', async (_event, password) => {
+    if (isUnlocked) return { state: store.publicState(), settings: settings.publicSettings() };
+    const now = Date.now();
+    if (now < unlockBlockedUntil) {
+      throw new Error(`密码错误次数过多，请在${Math.ceil((unlockBlockedUntil - now) / 1000)}秒后重试`);
+    }
+    if (!settings.verifyPassword(password)) {
+      unlockFailures += 1;
+      if (unlockFailures >= 5) {
+        unlockBlockedUntil = Date.now() + 30000;
+        unlockFailures = 0;
+      }
+      throw new Error('启动密码不正确');
+    }
+    unlockFailures = 0;
+    unlockBlockedUntil = 0;
+    isUnlocked = true;
+    restorePreviousSessions().catch(() => {});
+    return { state: store.publicState(), settings: settings.publicSettings() };
+  });
+  handleUnlocked('app:update-settings', async (_event, input) => {
+    const result = await settings.update(assertObject(input));
+    const unavailableShortcuts = registerGlobalShortcuts();
+    return { settings: result, unavailableShortcuts };
+  });
+
+  handleUnlocked('workspace:get-state', () => store.publicState());
+  handleUnlocked('workspace:add-site', async (_event, input) => {
+    const result = await store.addSite(assertObject(input));
+    send('workspace:changed', store.publicState());
+    return result;
+  });
+  handleUnlocked('workspace:add-account', async (_event, input) => {
+    const result = await store.addAccount(assertObject(input));
+    send('workspace:changed', store.publicState());
+    return result;
+  });
+  handleUnlocked('workspace:import-batch', async (_event, rows) => {
+    const result = await store.importBatch(rows);
+    send('workspace:changed', store.publicState());
+    return result;
+  });
+  handleUnlocked('workspace:update-account', async (_event, id, patch) => {
+    const account = store.findAccount(id);
+    if (!account) throw new Error('账户不存在');
+    const safePatch = assertObject(patch);
+    if (safePatch.password !== undefined) {
+      const previousRef = account.autoLogin?.secretRef;
+      safePatch.autoLogin = { ...(account.autoLogin || {}), ...(safePatch.autoLogin || {}) };
+      safePatch.autoLogin.secretRef = safePatch.password
+        ? await vault.set(safePatch.password, previousRef)
+        : '';
+      if (!safePatch.password && previousRef) await vault.remove(previousRef);
+      delete safePatch.password;
+    }
+    if (safePatch.proxyPassword !== undefined) {
+      const previousRef = account.proxy?.secretRef;
+      safePatch.proxy = { ...(account.proxy || {}), ...(safePatch.proxy || {}) };
+      safePatch.proxy.secretRef = safePatch.proxyPassword
+        ? await vault.set(safePatch.proxyPassword, previousRef)
+        : '';
+      if (!safePatch.proxyPassword && previousRef) await vault.remove(previousRef);
+      delete safePatch.proxyPassword;
+    }
+    const result = await store.updateAccount(id, safePatch);
+    send('workspace:changed', store.publicState());
+    return result;
+  });
+
+  handleUnlocked('browser:start', (_event, id, options) => profiles.start(id, options));
+  handleUnlocked('browser:stop', (_event, id) => profiles.stop(id));
+  handleUnlocked('browser:activate', (_event, id) => profiles.activate(id));
+  handleUnlocked('browser:navigate', (_event, id, url) => profiles.navigate(id, url));
+  handleUnlocked('browser:command', (_event, id, command) => profiles.command(id, command));
+  handleUnlocked('browser:set-bounds', (_event, bounds) => profiles.setBounds(assertObject(bounds)));
+  handleUnlocked('browser:set-proxy', async (_event, id, proxy) => {
+    const result = await profiles.applyProxy(id, proxy);
+    send('workspace:changed', store.publicState());
+    return result;
+  });
+  handleUnlocked('browser:clear', async (_event, id, mode) => {
+    const raw = profiles.currentUrl(id) || store.findAccount(id)?.startUrl;
+    const origin = raw ? new URL(raw).origin : '';
+    return profiles.clear(id, mode, origin);
+  });
+
+  handleUnlocked('diagnostics:run', async (_event, id) => {
+    const account = store.findAccount(id);
+    if (!account) throw new Error('账户不存在');
+    const ses = profiles.getSession(id);
+    await profiles.applyProxy(id, account.proxy);
+    return runDiagnostics(profiles.currentUrl(id) || account.startUrl, ses);
+  });
+
+  handleUnlocked('snapshot:create', async (_event, id, label) => {
+    const account = store.findAccount(id);
+    if (!account) throw new Error('账户不存在');
+    const result = await snapshots.create(account, profiles.getSession(id), label);
+    send('workspace:changed', store.publicState());
+    return result;
+  });
+  handleUnlocked('snapshot:restore', async (_event, snapshotId) => {
+    const metadata = store.data.snapshots.find((item) => item.id === snapshotId);
+    if (!metadata) throw new Error('快照不存在');
+    const account = store.findAccount(metadata.accountId);
+    if (!account) throw new Error('账户不存在');
+    if (profiles.isRunning(account.id)) await profiles.stop(account.id);
+    const payload = await snapshots.restore(metadata, account, profiles.getSession(account.id));
+    await store.updateAccount(account.id, {
+      currentUrl: payload.account.currentUrl,
+      proxy: payload.account.proxy,
+      environment: payload.account.environment,
+    });
+    send('workspace:changed', store.publicState());
+    return true;
+  });
+
+  handleUnlocked('bulk:run', async (_event, ids, action) => {
+    if (!Array.isArray(ids) || ids.length > 500) throw new Error('批量账户数量无效');
+    const queue = [...new Set(ids)];
+    const results = [];
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < queue.length) {
+        const id = queue[cursor++];
+        try {
+          if (action === 'start') await profiles.start(id, { activate: false });
+          else if (action === 'stop') await profiles.stop(id);
+          else if (action === 'reload') profiles.command(id, 'reload');
+          else if (action === 'clear-cache') await profiles.clear(id, 'cache');
+          else if (action === 'snapshot') {
+            const account = store.findAccount(id);
+            await snapshots.create(account, profiles.getSession(id));
+          } else throw new Error('不支持的批量操作');
+          results.push({ id, ok: true });
+        } catch (error) {
+          results.push({ id, ok: false, error: error.message });
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(3, queue.length) }, worker));
+    send('workspace:changed', store.publicState());
+    return results;
+  });
+
+  handleUnlocked('package:export', async (_event, { ids, password }) => {
+    if (!Array.isArray(ids) || !password || password.length < 8) {
+      throw new Error('请选择账户，并使用至少8位导出密码');
+    }
+    const selected = store.data.accounts.filter((account) => ids.includes(account.id));
+    if (!selected.length) throw new Error('没有选择要导出的账户');
+    const sites = store.data.sites.filter((site) => selected.some((account) => account.siteId === site.id));
+    const accounts = [];
+    for (const account of selected) {
+      const ses = profiles.getSession(account.id);
+      await ses.flushStorageData();
+      const portableAccount = structuredClone(account);
+      portableAccount.proxy.secretRef = '';
+      portableAccount.autoLogin.secretRef = '';
+      accounts.push({ account: portableAccount, cookies: await ses.cookies.get({}) });
+    }
+    const payload = { format: 1, exportedAt: new Date().toISOString(), sites, accounts };
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: '导出账户环境',
+      defaultPath: `ProfileDesk-${Date.now()}.pdesk`,
+      filters: [{ name: 'ProfileDesk加密包', extensions: ['pdesk'] }],
+    });
+    if (result.canceled || !result.filePath) return { canceled: true };
+    await fs.promises.writeFile(result.filePath, encryptPackage(payload, password), { mode: 0o600 });
+    return { canceled: false, filePath: result.filePath, count: accounts.length };
+  });
+
+  handleUnlocked('package:import', async (_event, password) => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: '导入账户环境',
+      properties: ['openFile'],
+      filters: [{ name: 'ProfileDesk加密包', extensions: ['pdesk'] }],
+    });
+    if (result.canceled || !result.filePaths[0]) return { canceled: true };
+    const importFile = result.filePaths[0];
+    const stat = await fs.promises.stat(importFile);
+    if (stat.size > 100 * 1024 * 1024) throw new Error('导入包超过100MB安全限制');
+    const payload = decryptPackage(await fs.promises.readFile(importFile), password);
+    if (payload.format !== 1 || !Array.isArray(payload.accounts) || !Array.isArray(payload.sites)) {
+      throw new Error('导入包版本不支持');
+    }
+    if (payload.accounts.length > 500) throw new Error('单次最多导入500个账户');
+    let count = 0;
+    for (const entry of payload.accounts) {
+      if (!entry?.account || !Array.isArray(entry.cookies)) throw new Error('导入包账户数据无效');
+      if (entry.cookies.length > 10000) throw new Error('单个账户Cookie数量异常');
+      const oldSite = payload.sites.find((site) => site.id === entry.account.siteId);
+      let site = store.data.sites.find((item) => item.name === oldSite?.name);
+      if (!site) site = await store.addSite({ name: oldSite?.name || '已导入业务站', homeUrl: oldSite?.homeUrl || entry.account.startUrl });
+      const account = await store.addAccount({
+        ...entry.account,
+        id: undefined,
+        siteId: site.id,
+        name: `${entry.account.name}（导入）`,
+        proxy: { ...(entry.account.proxy || {}), secretRef: '' },
+        autoLogin: { ...(entry.account.autoLogin || {}), enabled: false, secretRef: '' },
+      });
+      const ses = profiles.getSession(account.id);
+      for (const cookie of entry.cookies || []) {
+        const domain = String(cookie.domain || '').replace(/^\./, '');
+        if (!domain) continue;
+        const next = {
+          url: `${cookie.secure ? 'https' : 'http'}://${domain}${cookie.path || '/'}`,
+          name: cookie.name,
+          value: cookie.value,
+          domain: cookie.domain,
+          path: cookie.path,
+          secure: cookie.secure,
+          httpOnly: cookie.httpOnly,
+        };
+        if (cookie.expirationDate) next.expirationDate = cookie.expirationDate;
+        if (cookie.sameSite && cookie.sameSite !== 'unspecified') next.sameSite = cookie.sameSite;
+        await ses.cookies.set(next).catch(() => {});
+      }
+      await ses.flushStorageData();
+      count += 1;
+    }
+    send('workspace:changed', store.publicState());
+    return { canceled: false, count };
+  });
+}
+
+app.whenReady().then(async () => {
+  Menu.setApplicationMenu(null);
+  const rootDir = path.join(app.getPath('userData'), 'workspace');
+  store = new WorkspaceStore(rootDir);
+  vault = new SecretVault(rootDir, safeStorage);
+  settings = new SettingsService(rootDir);
+  await Promise.all([store.init(), vault.init(), settings.init()]);
+  isUnlocked = !settings.isLockedOnLaunch();
+  createMainWindow();
+  profiles = new ProfileManager({
+    mainWindow,
+    store,
+    vault,
+    rootDir,
+    onEvent: (event) => {
+      send('browser:event', event);
+      if (['started', 'stopped', 'crashed', 'navigation'].includes(event.type)) {
+        send('workspace:changed', store.publicState());
+      }
+      if (!shuttingDown && ['started', 'stopped', 'crashed'].includes(event.type)) {
+        const ids = [...profiles.instances.keys()];
+        restoreSave = restoreSave.catch(() => {}).then(() => store.setRestoreIds(ids));
+      }
+    },
+  });
+  await profiles.init();
+  snapshots = new SnapshotService(rootDir, store, vault);
+  await snapshots.init();
+  registerIpc();
+  registerGlobalShortcuts();
+  await mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+  mainWindow.once('ready-to-show', () => mainWindow.show());
+  if (!mainWindow.isVisible()) mainWindow.show();
+  if (isUnlocked) await restorePreviousSessions();
+});
+
+app.on('window-all-closed', () => {
+  app.quit();
+});
+
+app.on('will-quit', () => globalShortcut.unregisterAll());
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error.message);
+});

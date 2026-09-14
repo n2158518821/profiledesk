@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'none'">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ProfileDesk</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div id="app">
+      <aside class="sidebar">
+        <header class="brand">
+          <div class="brand-mark">P</div>
+          <div class="brand-copy"><strong>ProfileDesk</strong><span>本地账户隔离工作台</span></div>
+          <button id="toggle-sidebar" class="sidebar-toggle" title="收起账户栏" aria-label="收起账户栏">‹</button>
+        </header>
+
+        <div class="sidebar-actions">
+          <button id="add-site" class="primary"><span class="action-icon">＋</span><span class="action-label">业务站</span></button>
+          <button id="add-account"><span class="action-icon">＋</span><span class="action-label">账户</span></button>
+          <button id="batch-import" title="粘贴JSON批量添加"><span class="action-icon">⇩</span><span class="action-label">批量添加</span></button>
+        </div>
+        <input id="search" class="search" type="search" placeholder="搜索业务站、账户或标签">
+
+        <div class="bulk-bar">
+          <label><input id="select-all" type="checkbox"> 已选 <span id="selected-count">0</span></label>
+          <select id="bulk-action" aria-label="批量操作">
+            <option value="start">批量启动</option>
+            <option value="stop">批量停止</option>
+            <option value="reload">批量刷新</option>
+            <option value="clear-cache">批量清缓存</option>
+            <option value="snapshot">批量快照</option>
+          </select>
+          <button id="run-bulk">执行</button>
+        </div>
+
+        <nav id="account-tree" class="account-tree" aria-label="业务站与账户"></nav>
+
+        <footer class="sidebar-footer">
+          <button id="app-settings" title="软件设置"><span class="footer-icon">⚙</span><span class="footer-label">设置</span></button>
+          <button id="export-package" title="导出"><span class="footer-icon">⇧</span><span class="footer-label">导出</span></button>
+          <button id="import-package" title="导入"><span class="footer-icon">⇩</span><span class="footer-label">导入</span></button>
+          <span class="secure-label">本机加密</span>
+        </footer>
+      </aside>
+
+      <main class="workspace">
+        <div class="topbar">
+          <div class="nav-buttons">
+            <button data-command="back" title="后退">←</button>
+            <button data-command="forward" title="前进">→</button>
+            <button data-command="reload" title="刷新">↻</button>
+            <button data-command="home" title="首页">⌂</button>
+          </div>
+          <form id="address-form" class="address-wrap">
+            <span id="security-indicator">—</span>
+            <input id="address" autocomplete="off" spellcheck="false" placeholder="输入网址">
+          </form>
+          <div class="proxy-wrap">
+            <span>代理</span>
+            <select id="proxy-mode" aria-label="当前窗口代理">
+              <option value="system">本地/系统</option>
+              <option value="direct">强制直连</option>
+              <option value="fixed_servers">自定义代理</option>
+            </select>
+            <button id="proxy-config" title="编辑自定义代理">设置</button>
+          </div>
+          <button id="account-settings">环境设置</button>
+          <button id="create-snapshot">保存快照</button>
+        </div>
+
+        <section id="browser-stage" class="browser-stage">
+          <div id="empty-state" class="empty-state">
+            <div class="empty-icon">◎</div>
+            <h1>选择一个账户开始</h1>
+            <p>每个账户都有独立的 Cookie、缓存、站点存储与代理线路。</p>
+            <button id="empty-add-account" class="primary">添加第一个账户</button>
+          </div>
+        </section>
+
+        <section id="diagnostics-panel" class="diagnostics-panel" hidden>
+          <header><strong>连接检测</strong><span id="diagnostics-target"></span><button id="close-diagnostics">收起</button></header>
+          <div id="diagnostics-results" class="diagnostics-results"></div>
+        </section>
+
+        <footer class="statusbar">
+          <span id="active-label">未选择账户</span>
+          <span id="status-message">就绪</span>
+          <div class="status-actions">
+            <button id="run-diagnostics">检测 DNS / TCP / TLS / HTTP</button>
+            <select id="clear-mode" aria-label="清理范围">
+              <option value="cache">仅清缓存（保留登录）</option>
+              <option value="history">缓存与离线记录</option>
+              <option value="site">当前站点数据（退出本站）</option>
+              <option value="all">重置账户环境（全部退出）</option>
+            </select>
+            <button id="clear-current" class="danger-subtle">清理当前窗口</button>
+          </div>
+        </footer>
+      </main>
+    </div>
+
+    <dialog id="editor-dialog">
+      <form id="editor-form" method="dialog">
+        <header><strong id="editor-title">配置</strong><button type="button" data-close-dialog>×</button></header>
+        <div id="editor-fields" class="dialog-fields"></div>
+        <footer><button type="button" data-close-dialog>取消</button><button id="editor-submit" value="default" class="primary">保存</button></footer>
+      </form>
+    </dialog>
+
+    <dialog id="batch-dialog">
+      <form id="batch-form" method="dialog">
+        <header><strong>批量添加业务站与账户</strong><button type="button" data-close-dialog>×</button></header>
+        <p>每行一个 JSON 对象，最多500行。只批量建站可省略 accountName；添加账户时填写 accountName。</p>
+        <textarea id="batch-input" rows="13" spellcheck="false" placeholder='{"siteName":"示例业务","accountName":"客服A","startUrl":"https://example.com/login","username":"agent-a"}'></textarea>
+        <footer><button type="button" data-close-dialog>取消</button><button value="default" class="primary">导入</button></footer>
+      </form>
+    </dialog>
+
+    <dialog id="snapshot-dialog">
+      <form method="dialog">
+        <header><strong>选择状态快照</strong><button type="button" data-close-dialog>×</button></header>
+        <div id="snapshot-list" class="snapshot-list"></div>
+        <footer><button type="button" data-close-dialog>关闭</button><button id="snapshot-create-new" type="button" class="primary">创建新快照</button></footer>
+      </form>
+    </dialog>
+
+    <dialog id="lock-dialog" class="lock-dialog">
+      <form id="lock-form">
+        <div class="lock-mark">P</div>
+        <h1>ProfileDesk 已锁定</h1>
+        <p>输入启动密码后才会加载账户和浏览会话。</p>
+        <input id="unlock-password" type="password" autocomplete="current-password" placeholder="启动密码" required autofocus>
+        <span id="unlock-error" class="lock-error"></span>
+        <button id="unlock-submit" class="primary">解锁</button>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="app.js"></script>
+  </body>
+</html>
