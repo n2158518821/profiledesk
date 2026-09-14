@@ -32,9 +32,18 @@ jobs:
           node-version: 24
       - run: npm install --allow-git=all
       - run: npm run verify
-      - run: ${{ matrix.command }}
+      - name: Build Windows package
+        if: runner.os == 'Windows'
+        run: ${{ matrix.command }}
+      - name: Build macOS package
+        if: runner.os == 'macOS'
+        run: ${{ matrix.command }}
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact-name }}
