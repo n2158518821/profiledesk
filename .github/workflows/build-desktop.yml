@@ -14,8 +14,16 @@ jobs:
         include:
           - os: windows-latest
             command: npm run dist:win
+            artifact-name: ProfileDesk-Windows
+            artifact-path: release/*.exe
           - os: macos-latest
-            command: npm run dist:mac
+            command: npm run dist:mac:x64
+            artifact-name: ProfileDesk-macOS-Intel
+            artifact-path: release/*.dmg
+          - os: macos-latest
+            command: npm run dist:mac:arm64
+            artifact-name: ProfileDesk-macOS-AppleSilicon
+            artifact-path: release/*.dmg
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -29,5 +37,7 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
       - uses: actions/upload-artifact@v4
         with:
-          name: ProfileDesk-${{ runner.os }}
-          path: release/**
+          name: ${{ matrix.artifact-name }}
+          path: ${{ matrix.artifact-path }}
+          if-no-files-found: error
+          compression-level: 0
