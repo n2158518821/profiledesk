@@ -18,11 +18,11 @@ jobs:
             command: npm run dist:mac
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
-      - run: npm install
+      - run: npm install --allow-git=all
       - run: npm run verify
       - run: ${{ matrix.command }}
         env:
