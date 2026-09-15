@@ -40,6 +40,24 @@ test('changing protected settings requires current password', async (t) => {
   assert.equal(settings.isLockedOnLaunch(), true);
 });
 
+test('launch password accepts four characters and rejects shorter values', async (t) => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'profiledesk-short-password-'));
+  t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+  const settings = new SettingsService(directory);
+  await settings.init();
+  await assert.rejects(() => settings.update({
+    launchPasswordEnabled: true,
+    newPassword: '123',
+    shortcuts: DEFAULT_SHORTCUTS,
+  }), /至少需要4个字符/);
+  await settings.update({
+    launchPasswordEnabled: true,
+    newPassword: '1234',
+    shortcuts: DEFAULT_SHORTCUTS,
+  });
+  assert.equal(settings.verifyPassword('1234'), true);
+});
+
 test('duplicate shortcuts are rejected', () => {
   assert.throws(() => normalizeShortcuts({
     ...DEFAULT_SHORTCUTS,

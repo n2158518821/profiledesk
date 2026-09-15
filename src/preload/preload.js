@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld('profileDesk', Object.freeze({
   activate: (id) => invoke('browser:activate', id),
   navigate: (id, url) => invoke('browser:navigate', id, url),
   command: (id, command) => invoke('browser:command', id, command),
+  applyEnvironment: (id) => invoke('browser:apply-environment', id),
   setBounds: (bounds) => invoke('browser:set-bounds', bounds),
   setProxy: (id, proxy) => invoke('browser:set-proxy', id, proxy),
   clear: (id, mode) => invoke('browser:clear', id, mode),

@@ -1,7 +1,14 @@
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { app, session, WebContentsView } = require('electron');
-const { normalizeProxy, normalizeUrl } = require('../shared/model');
+const {
+  MOBILE_DEVICE_PROFILES,
+  normalizeEnvironment,
+  normalizeProxy,
+  normalizeUrl,
+  resolveUserAgent,
+} = require('../shared/model');
 
 function safeFileName(input) {
   return String(input || 'download')
@@ -10,11 +17,12 @@ function safeFileName(input) {
 }
 
 class ProfileManager {
-  constructor({ mainWindow, store, vault, rootDir, onEvent }) {
+  constructor({ mainWindow, store, vault, rootDir, safeMode = false, onEvent }) {
     this.mainWindow = mainWindow;
     this.store = store;
     this.vault = vault;
     this.rootDir = rootDir;
+    this.safeMode = Boolean(safeMode);
     this.profileRoot = path.join(rootDir, 'profiles');
     this.downloadRoot = path.join(rootDir, 'downloads');
     this.instances = new Map();
@@ -27,6 +35,9 @@ class ProfileManager {
     this.memoryLimitMb = 4096;
     this.startQueue = Promise.resolve();
     this.resourceTimer = null;
+    this.usageTimer = null;
+    this.cpuSample = this.cpuTimes();
+    this.lastResourceWarningAt = 0;
     this.acceptingStarts = true;
     this.blockedAccountIds = new Set();
     app.on('login', (event, webContents, _details, authInfo, callback) => {
@@ -48,6 +59,8 @@ class ProfileManager {
     ]);
     this.resourceTimer = setInterval(() => this.sweepResources().catch(() => {}), 60000);
     this.resourceTimer.unref?.();
+    this.usageTimer = setInterval(() => this.reportResourceUsage(), 2000);
+    this.usageTimer.unref?.();
   }
 
   profilePath(accountId) {
@@ -116,6 +129,54 @@ class ProfileManager {
     });
   }
 
+  layoutForEnvironment(environment) {
+    const normalized = normalizeEnvironment(environment);
+    if (this.safeMode || normalized.deviceType !== 'mobile') {
+      return { bounds: this.bounds, profile: null };
+    }
+    const profile = MOBILE_DEVICE_PROFILES[normalized.mobileDevice]
+      || MOBILE_DEVICE_PROFILES['pixel-11-pro'];
+    const width = Math.max(1, Math.min(this.bounds.width, profile.width));
+    return {
+      bounds: {
+        x: this.bounds.x + Math.max(0, Math.floor((this.bounds.width - width) / 2)),
+        y: this.bounds.y,
+        width,
+        height: this.bounds.height,
+      },
+      profile,
+    };
+  }
+
+  applyEnvironmentToInstance(account, instance) {
+    const environment = normalizeEnvironment(account.environment);
+    const contents = instance.view.webContents;
+    contents.setUserAgent(resolveUserAgent(environment) || instance.defaultUserAgent);
+    const layout = this.layoutForEnvironment(environment);
+    instance.view.setBounds(layout.bounds);
+    instance.environmentLayout = layout.profile?.id || 'desktop';
+    return layout.profile;
+  }
+
+  applyEnvironment(accountId, { reload = false } = {}) {
+    const account = this.store.findAccount(accountId);
+    if (!account) throw new Error('账户不存在');
+    const environment = normalizeEnvironment(account.environment);
+    const profile = environment.deviceType === 'mobile'
+      ? MOBILE_DEVICE_PROFILES[environment.mobileDevice]
+      : null;
+    const instance = this.instances.get(accountId);
+    if (instance) {
+      this.applyEnvironmentToInstance(account, instance);
+      if (reload && !instance.view.webContents.isDestroyed()) instance.view.webContents.reload();
+    }
+    return {
+      running: Boolean(instance),
+      device: profile?.id || 'desktop',
+      label: profile?.label || 'PC桌面设备',
+    };
+  }
+
   start(accountId, options = {}) {
     if (!this.acceptingStarts || this.blockedAccountIds.has(accountId)) return Promise.reject(new Error('账户正在关闭或删除'));
     const result = this.startQueue.then(() => this.startInternal(accountId, options));
@@ -148,11 +209,9 @@ class ProfileManager {
       },
     });
     view.setBackgroundColor('#0c111d');
-    view.setBounds(this.bounds);
     view.setVisible(false);
     const contents = view.webContents;
     contents.setBackgroundThrottling(true);
-    if (account.environment?.userAgent) contents.setUserAgent(account.environment.userAgent);
 
     contents.setWindowOpenHandler(({ url }) => {
       if (/^https?:\/\//i.test(url)) contents.loadURL(url).catch(() => {});
@@ -174,7 +233,15 @@ class ProfileManager {
     contents.on('did-finish-load', () => this.tryAutoFill(accountId).catch(() => {}));
 
     this.mainWindow.contentView.addChildView(view);
-    this.instances.set(accountId, { view, session: ses, lastActiveAt: Date.now() });
+    const instance = {
+      view,
+      session: ses,
+      lastActiveAt: Date.now(),
+      defaultUserAgent: contents.getUserAgent(),
+      environmentLayout: 'desktop',
+    };
+    this.instances.set(accountId, instance);
+    this.applyEnvironmentToInstance(account, instance);
     await this.store.updateAccount(accountId, {
       status: 'running',
       lastOpenedAt: new Date().toISOString(),
@@ -232,7 +299,8 @@ class ProfileManager {
     for (const [id, instance] of this.instances) {
       instance.view.setVisible(id === accountId);
       if (id === accountId) {
-        instance.view.setBounds(this.bounds);
+        const account = this.store.findAccount(id);
+        if (account) this.applyEnvironmentToInstance(account, instance);
         instance.lastActiveAt = Date.now();
       }
     }
@@ -249,7 +317,11 @@ class ProfileManager {
       height: Math.max(1, Math.round(bounds.height || 1)),
     };
     this.bounds = next;
-    if (this.activeId) this.instances.get(this.activeId)?.view.setBounds(next);
+    if (this.activeId) {
+      const account = this.store.findAccount(this.activeId);
+      const instance = this.instances.get(this.activeId);
+      if (account && instance) this.applyEnvironmentToInstance(account, instance);
+    }
   }
 
   async stop(accountId) {
@@ -345,21 +417,61 @@ class ProfileManager {
     }
   }
 
-  async releaseForMemoryPressure() {
-    const candidates = [...this.instances.entries()]
-      .filter(([id]) => id !== this.activeId)
-      .sort((left, right) => left[1].lastActiveAt - right[1].lastActiveAt)
-      .map(([id]) => id);
-    for (const id of candidates) {
-      if (this.workingSetMb() <= this.memoryLimitMb) break;
-      await this.stop(id);
-      this.emit('resource-released', { accountId: id, reason: 'memory' });
+  cpuTimes() {
+    return os.cpus().reduce((result, cpu) => {
+      const total = Object.values(cpu.times).reduce((sum, value) => sum + value, 0);
+      result.idle += cpu.times.idle;
+      result.total += total;
+      return result;
+    }, { idle: 0, total: 0 });
+  }
+
+  resourceUsage() {
+    const currentCpu = this.cpuTimes();
+    const idleDelta = currentCpu.idle - this.cpuSample.idle;
+    const totalDelta = currentCpu.total - this.cpuSample.total;
+    this.cpuSample = currentCpu;
+    const totalMemory = os.totalmem();
+    const usedMemory = Math.max(0, totalMemory - os.freemem());
+    let appCpuPercent = 0;
+    try {
+      appCpuPercent = app.getAppMetrics().reduce(
+        (sum, metric) => sum + Number(metric.cpu?.percentCPUUsage || 0),
+        0,
+      );
+    } catch {
+      appCpuPercent = 0;
     }
+    return {
+      systemCpuPercent: totalDelta > 0
+        ? Math.min(100, Math.max(0, ((totalDelta - idleDelta) / totalDelta) * 100))
+        : 0,
+      systemMemoryPercent: totalMemory > 0 ? Math.min(100, (usedMemory / totalMemory) * 100) : 0,
+      appMemoryMb: this.workingSetMb(),
+      appCpuPercent: Math.max(0, appCpuPercent),
+      runningAccounts: this.instances.size,
+      memoryLimitMb: this.memoryLimitMb,
+    };
+  }
+
+  reportResourceUsage() {
+    const usage = this.resourceUsage();
+    this.emit('resource-usage', usage);
+    const reasons = [];
+    if (usage.appMemoryMb >= this.memoryLimitMb) reasons.push('ProfileDesk内存达到提醒阈值');
+    if (usage.systemMemoryPercent >= 90) reasons.push('系统内存占用超过90%');
+    if (usage.systemCpuPercent >= 95) reasons.push('系统CPU占用超过95%');
+    const now = Date.now();
+    if (reasons.length && now - this.lastResourceWarningAt >= 60000) {
+      this.lastResourceWarningAt = now;
+      this.emit('resource-warning', { ...usage, reasons });
+    }
+    return usage;
   }
 
   async sweepResources() {
     await this.stopIdleInstances();
-    await this.releaseForMemoryPressure();
+    this.reportResourceUsage();
   }
 
   async removeAccountData(accountId) {
@@ -389,6 +501,8 @@ class ProfileManager {
     await this.startQueue.catch(() => {});
     if (this.resourceTimer) clearInterval(this.resourceTimer);
     this.resourceTimer = null;
+    if (this.usageTimer) clearInterval(this.usageTimer);
+    this.usageTimer = null;
     await this.stopAll();
   }
 

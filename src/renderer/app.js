@@ -19,7 +19,18 @@ let appSettings = {
     toggleSidebar: 'CommandOrControl+Shift+B',
   },
 };
+const SIDEBAR_AVATAR_SIZE = 38;
+const SIDEBAR_MIN_WIDTH = Math.ceil(SIDEBAR_AVATAR_SIZE * 1.5) + 14;
+const SIDEBAR_COMPACT_WIDTH = 104;
+const SIDEBAR_COMPACT_THRESHOLD = 176;
+const SIDEBAR_DEFAULT_WIDTH = 292;
+const savedSidebarWidth = Number.parseInt(localStorage.getItem('profiledesk.sidebarWidth'), 10);
 let sidebarCollapsed = localStorage.getItem('profiledesk.sidebarCollapsed') === '1';
+let sidebarWidth = Number.isFinite(savedSidebarWidth)
+  ? savedSidebarWidth
+  : (sidebarCollapsed ? SIDEBAR_COMPACT_WIDTH : SIDEBAR_DEFAULT_WIDTH);
+let expandedSidebarWidth = Math.max(SIDEBAR_DEFAULT_WIDTH, sidebarWidth);
+let boundsFrame = 0;
 let collapsedSiteIds = new Set();
 try {
   const savedSites = JSON.parse(localStorage.getItem('profiledesk.collapsedSites') || '[]');
@@ -45,6 +56,34 @@ function friendlyError(error) {
 
 function initial(value) {
   return Array.from(String(value || '?').trim())[0]?.toUpperCase() || '?';
+}
+
+const SITE_COLOR_OPTIONS = [
+  ['blue', '深蓝'],
+  ['purple', '紫色'],
+  ['green', '绿色'],
+  ['orange', '橙色'],
+  ['red', '红色'],
+  ['slate', '灰蓝'],
+];
+
+function safeSiteColor(value) {
+  return SITE_COLOR_OPTIONS.some(([id]) => id === value) ? value : 'blue';
+}
+
+function safeAvatarDataUrl(value) {
+  const dataUrl = String(value || '');
+  return dataUrl.length <= 150 * 1024
+    && /^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(dataUrl)
+    ? dataUrl
+    : '';
+}
+
+function avatarContent(dataUrl, name) {
+  const safe = safeAvatarDataUrl(dataUrl);
+  return safe
+    ? `<img src="${escapeHtml(safe)}" alt="${escapeHtml(name)}">`
+    : `<span>${escapeHtml(initial(name))}</span>`;
 }
 
 function showToast(message, error = false) {
@@ -94,12 +133,12 @@ function renderTree() {
     if (query && !matching.length && !site.name.toLowerCase().includes(query)) continue;
     const isCollapsed = collapsedSiteIds.has(site.id) && !query;
     blocks.push(`<section class="site-group${isCollapsed ? ' is-collapsed' : ''}">
-      <div class="site-heading" data-toggle-site="${site.id}" title="${escapeHtml(site.name)}">
+      <div class="site-heading site-color-${safeSiteColor(site.color)}" data-toggle-site="${site.id}" title="${escapeHtml(site.name)}">
         <span class="site-arrow">▾</span><span class="site-icon">${escapeHtml(initial(site.name))}</span><span class="site-name">${escapeHtml(site.name)}</span><span class="count">${accounts.length}</span>
       </div>
       <div class="site-accounts">${matching.map((account) => `<div class="account-row${account.id === activeAccountId ? ' active' : ''}" data-account-id="${account.id}" title="${escapeHtml(account.name)} · ${escapeHtml(account.username || account.startUrl)}">
         <input type="checkbox" data-select-account="${account.id}" ${selectedIds.has(account.id) ? 'checked' : ''} aria-label="选择${escapeHtml(account.name)}">
-        <span class="account-avatar">${escapeHtml(initial(account.name))}</span>
+        <span class="account-avatar">${avatarContent(account.avatarDataUrl, account.name)}</span>
         <span class="dot ${escapeHtml(account.status)}"></span>
         <div class="account-main"><strong>${escapeHtml(account.name)}</strong><span>${escapeHtml(account.username || account.startUrl)}</span></div>
         <button class="row-delete" data-delete-account="${account.id}" title="删除账户" aria-label="删除${escapeHtml(account.name)}">删</button>
@@ -111,17 +150,79 @@ function renderTree() {
   $('#select-all').checked = Boolean(workspace.accounts.length) && selectedIds.size === workspace.accounts.length;
 }
 
-function updateSidebarState() {
+function maximumSidebarWidth() {
+  return Math.max(SIDEBAR_MIN_WIDTH, window.innerWidth - 560);
+}
+
+function updateSidebarState({ persist = true } = {}) {
+  sidebarWidth = Math.min(maximumSidebarWidth(), Math.max(SIDEBAR_MIN_WIDTH, Math.round(sidebarWidth)));
+  sidebarCollapsed = sidebarWidth < SIDEBAR_COMPACT_THRESHOLD;
+  const compactProgress = Math.min(1, Math.max(0, (sidebarWidth - SIDEBAR_MIN_WIDTH) / (SIDEBAR_COMPACT_THRESHOLD - SIDEBAR_MIN_WIDTH)));
+  const compactFontSize = (8.5 + compactProgress * 2.5).toFixed(2);
+  document.documentElement.style.setProperty('--sidebar-width', `${sidebarWidth}px`);
+  document.documentElement.style.setProperty('--compact-site-font-size', `${compactFontSize}px`);
   $('#app').classList.toggle('sidebar-collapsed', sidebarCollapsed);
   $('#toggle-sidebar').title = sidebarCollapsed ? '展开账户栏' : '收起账户栏';
   $('#toggle-sidebar').setAttribute('aria-label', sidebarCollapsed ? '展开账户栏' : '收起账户栏');
-  localStorage.setItem('profiledesk.sidebarCollapsed', sidebarCollapsed ? '1' : '0');
-  setTimeout(requestBrowserBounds, 220);
+  $('#sidebar-resizer').setAttribute('aria-valuenow', String(sidebarWidth));
+  $('#sidebar-resizer').setAttribute('aria-valuemax', String(maximumSidebarWidth()));
+  if (persist) {
+    localStorage.setItem('profiledesk.sidebarWidth', String(sidebarWidth));
+    localStorage.setItem('profiledesk.sidebarCollapsed', sidebarCollapsed ? '1' : '0');
+  }
+  requestBrowserBounds();
 }
 
 function toggleSidebar() {
-  sidebarCollapsed = !sidebarCollapsed;
+  if (sidebarCollapsed) {
+    sidebarWidth = Math.max(SIDEBAR_COMPACT_THRESHOLD, expandedSidebarWidth);
+  } else {
+    expandedSidebarWidth = sidebarWidth;
+    sidebarWidth = SIDEBAR_COMPACT_WIDTH;
+  }
   updateSidebarState();
+}
+
+function bindSidebarResizer() {
+  const resizer = $('#sidebar-resizer');
+  let activePointerId = null;
+  const resizeTo = (clientX, persist = false) => {
+    sidebarWidth = Math.min(maximumSidebarWidth(), Math.max(SIDEBAR_MIN_WIDTH, clientX));
+    if (sidebarWidth >= SIDEBAR_COMPACT_THRESHOLD) expandedSidebarWidth = sidebarWidth;
+    updateSidebarState({ persist });
+  };
+  resizer.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    activePointerId = event.pointerId;
+    resizer.setPointerCapture(event.pointerId);
+    document.body.classList.add('resizing-sidebar');
+    event.preventDefault();
+  });
+  resizer.addEventListener('pointermove', (event) => {
+    if (event.pointerId !== activePointerId) return;
+    resizeTo(event.clientX);
+  });
+  const finish = (event) => {
+    if (event.pointerId !== activePointerId) return;
+    activePointerId = null;
+    document.body.classList.remove('resizing-sidebar');
+    updateSidebarState();
+  };
+  resizer.addEventListener('pointerup', finish);
+  resizer.addEventListener('pointercancel', finish);
+  resizer.addEventListener('dblclick', () => {
+    sidebarWidth = SIDEBAR_DEFAULT_WIDTH;
+    expandedSidebarWidth = SIDEBAR_DEFAULT_WIDTH;
+    updateSidebarState();
+  });
+  resizer.addEventListener('keydown', (event) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home'].includes(event.key)) return;
+    if (event.key === 'Home') sidebarWidth = SIDEBAR_DEFAULT_WIDTH;
+    else sidebarWidth += event.key === 'ArrowLeft' ? -8 : 8;
+    if (sidebarWidth >= SIDEBAR_COMPACT_THRESHOLD) expandedSidebarWidth = sidebarWidth;
+    updateSidebarState();
+    event.preventDefault();
+  });
 }
 
 function syncActiveUi() {
@@ -142,13 +243,17 @@ function syncActiveUi() {
 }
 
 function requestBrowserBounds() {
-  const stage = $('#browser-stage');
-  const modalOpen = Boolean(document.querySelector('dialog[open]'));
-  const rect = stage.getBoundingClientRect();
-  const bounds = modalOpen
-    ? { x: 0, y: 0, width: 1, height: 1 }
-    : { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-  api.setBounds(bounds).catch(() => {});
+  if (boundsFrame) cancelAnimationFrame(boundsFrame);
+  boundsFrame = requestAnimationFrame(() => {
+    boundsFrame = 0;
+    const stage = $('#browser-stage');
+    const modalOpen = Boolean(document.querySelector('dialog[open]'));
+    const rect = stage.getBoundingClientRect();
+    const bounds = modalOpen
+      ? { x: 0, y: 0, width: 1, height: 1 }
+      : { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    api.setBounds(bounds).catch(() => {});
+  });
 }
 
 async function activateAccount(id) {
@@ -166,6 +271,119 @@ async function activateAccount(id) {
 
 function field(label, name, value = '', type = 'text', extra = '') {
   return `<label for="field-${name}">${escapeHtml(label)}</label><input id="field-${name}" name="${name}" type="${type}" value="${escapeHtml(value)}" ${extra}>`;
+}
+
+function selectField(label, name, value, options) {
+  const items = options.map(([optionValue, optionLabel]) => (
+    `<option value="${escapeHtml(optionValue)}" ${optionValue === value ? 'selected' : ''}>${escapeHtml(optionLabel)}</option>`
+  )).join('');
+  return `<label for="field-${name}">${escapeHtml(label)}</label><select id="field-${name}" name="${name}">${items}</select>`;
+}
+
+function avatarField(dataUrl = '', name = '账户') {
+  const safe = safeAvatarDataUrl(dataUrl);
+  return `<label>账户头像</label><div class="avatar-picker">
+    <span class="avatar-preview" data-avatar-preview>${avatarContent(safe, name)}</span>
+    <div class="avatar-buttons"><button type="button" data-pick-avatar>本地上传</button><button type="button" data-remove-avatar ${safe ? '' : 'disabled'}>移除</button></div>
+    <input type="hidden" name="avatarDataUrl" value="${escapeHtml(safe)}">
+    <input type="file" data-avatar-file accept="image/png,image/jpeg,image/webp" hidden>
+  </div><span></span><span class="hint">支持PNG、JPG、WebP，原图最大5MB；保存前自动裁剪压缩为128×128，仅保存在本地账户数据中。</span>`;
+}
+
+async function avatarDataFromFile(file) {
+  if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) throw new Error('头像只支持PNG、JPG或WebP');
+  if (file.size > 5 * 1024 * 1024) throw new Error('头像原图不能超过5MB');
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const image = new Image();
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+      image.onerror = () => reject(new Error('无法读取头像图片'));
+      image.src = objectUrl;
+    });
+    const side = Math.min(image.naturalWidth, image.naturalHeight);
+    if (!side) throw new Error('头像图片尺寸无效');
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 128;
+    const context = canvas.getContext('2d', { alpha: false });
+    context.fillStyle = '#17263a';
+    context.fillRect(0, 0, 128, 128);
+    context.drawImage(
+      image,
+      (image.naturalWidth - side) / 2,
+      (image.naturalHeight - side) / 2,
+      side,
+      side,
+      0,
+      0,
+      128,
+      128,
+    );
+    const result = canvas.toDataURL('image/webp', 0.82);
+    if (!safeAvatarDataUrl(result)) throw new Error('头像压缩后仍然过大');
+    return result;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+function bindAvatarPicker() {
+  const root = $('#editor-fields');
+  const fileInput = root.querySelector('[data-avatar-file]');
+  if (!fileInput) return;
+  const valueInput = root.querySelector('[name="avatarDataUrl"]');
+  const preview = root.querySelector('[data-avatar-preview]');
+  const removeButton = root.querySelector('[data-remove-avatar]');
+  const nameInput = root.querySelector('[name="name"]');
+  const renderPreview = () => {
+    preview.innerHTML = avatarContent(valueInput.value, nameInput?.value || '账户');
+    removeButton.disabled = !valueInput.value;
+  };
+  root.querySelector('[data-pick-avatar]').addEventListener('click', () => fileInput.click());
+  removeButton.addEventListener('click', () => {
+    valueInput.value = '';
+    fileInput.value = '';
+    renderPreview();
+  });
+  nameInput?.addEventListener('input', () => {
+    if (!valueInput.value) renderPreview();
+  });
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files?.[0];
+    if (!file) return;
+    try {
+      valueInput.value = await avatarDataFromFile(file);
+      renderPreview();
+    } catch (error) {
+      fileInput.value = '';
+      showToast(friendlyError(error), true);
+    }
+  });
+}
+
+function bindUserAgentFields() {
+  const root = $('#editor-fields');
+  const deviceType = root.querySelector('[name="deviceType"]');
+  const mobileDevice = root.querySelector('[name="mobileDevice"]');
+  const preset = root.querySelector('[name="browserPreset"]');
+  const custom = root.querySelector('[name="userAgent"]');
+  if (!preset || !custom) return;
+  const sync = () => {
+    custom.readOnly = preset.value !== 'custom';
+    custom.placeholder = preset.value === 'custom'
+      ? '输入完整User-Agent'
+      : '当前使用内置预设；选择“自定义”后可编辑';
+    if (mobileDevice) {
+      const mobile = deviceType?.value === 'mobile';
+      mobileDevice.closest('.device-field')?.classList.toggle('is-inactive', !mobile);
+      mobileDevice.title = mobile ? '保存后按此设备尺寸刷新当前页面' : '切换到移动设备后生效';
+    }
+  };
+  deviceType?.addEventListener('change', sync);
+  mobileDevice?.addEventListener('change', sync);
+  preset.addEventListener('change', sync);
+  sync();
 }
 
 function checkField(label, name, checked, hint = '') {
@@ -190,8 +408,9 @@ function addSite() {
   openEditor('添加业务站', [
     field('业务站名称', 'name', '', 'text', 'required maxlength="80"'),
     field('首页地址', 'homeUrl', 'https://', 'url', 'required'),
+    selectField('折叠背景色', 'color', 'blue', SITE_COLOR_OPTIONS),
   ].join(''), async (data) => {
-    await api.addSite({ name: data.get('name'), homeUrl: data.get('homeUrl') });
+    await api.addSite({ name: data.get('name'), homeUrl: data.get('homeUrl'), color: data.get('color') });
     showToast('业务站已添加');
   });
 }
@@ -202,6 +421,7 @@ function addAccount() {
   openEditor('添加隔离账户', [
     `<label for="field-siteId">所属业务站</label><select id="field-siteId" name="siteId">${options}</select>`,
     field('账户名称', 'name', '', 'text', 'required maxlength="80"'),
+    avatarField('', '账户'),
     field('登录名/标识', 'username'),
     field('启动地址', 'startUrl', workspace.sites[0].homeUrl, 'url', 'required'),
   ].join(''), async (data) => {
@@ -210,6 +430,7 @@ function addAccount() {
     showToast('隔离账户已创建');
     await activateAccount(result.id);
   });
+  bindAvatarPicker();
 }
 
 function editAccount() {
@@ -219,10 +440,28 @@ function editAccount() {
   const login = account.autoLogin || {};
   openEditor(`环境与登录 · ${account.name}`, [
     field('账户名称', 'name', account.name, 'text', 'required maxlength="80"'),
+    avatarField(account.avatarDataUrl, account.name),
     field('登录名', 'username', account.username),
     field('启动地址', 'startUrl', account.startUrl, 'url', 'required'),
+    selectField('设备类型', 'deviceType', env.deviceType || 'desktop', [
+      ['desktop', 'PC桌面设备'],
+      ['mobile', '移动设备'],
+    ]),
+    `<div class="device-field"><label for="field-mobileDevice">移动设备型号</label><select id="field-mobileDevice" name="mobileDevice">
+      <option value="pixel-11-pro" ${(env.mobileDevice || 'pixel-11-pro') === 'pixel-11-pro' ? 'selected' : ''}>Google Pixel 11 Pro · Android 17</option>
+      <option value="iphone-17-pro" ${env.mobileDevice === 'iphone-17-pro' ? 'selected' : ''}>Apple iPhone 17 Pro</option>
+    </select></div>`,
+    selectField('浏览器UA', 'browserPreset', env.browserPreset || 'system', [
+      ['system', '自动匹配设备（推荐）'],
+      ['chrome', 'Chrome'],
+      ['edge', 'Microsoft Edge'],
+      ['firefox', 'Firefox兼容标识'],
+      ['safari', 'Safari兼容标识（iPhone）'],
+      ['custom', '自定义User-Agent'],
+    ]),
     field('浏览器语言', 'acceptLanguage', env.acceptLanguage, 'text', 'placeholder="zh-CN,zh;q=0.9,en;q=0.8"'),
-    field('User-Agent', 'userAgent', env.userAgent, 'text', 'placeholder="留空使用内置Chrome默认值"'),
+    field('自定义User-Agent', 'userAgent', env.userAgent, 'text', 'maxlength="512"'),
+    '<span></span><span class="hint">移动模式会应用对应设备宽度的兼容视口和移动UA，并在保存后自动刷新；网页本身仍需支持响应式移动布局。为保证Windows稳定性，不调用Chromium实验性设备模拟接口。</span>',
     checkField('拒绝跟踪', 'doNotTrack', env.doNotTrack, '向网站发送DNT请求头'),
     checkField('自动填充', 'autoLogin', login.enabled, '仅在完全匹配的HTTPS来源填充，不自动提交'),
     field('登录页地址', 'loginUrl', login.loginUrl || account.startUrl, 'url'),
@@ -233,9 +472,18 @@ function editAccount() {
     const next = Object.fromEntries(data);
     await api.updateAccount(account.id, {
       name: next.name,
+      avatarDataUrl: next.avatarDataUrl,
       username: next.username,
       startUrl: next.startUrl,
-      environment: { ...env, acceptLanguage: next.acceptLanguage, userAgent: next.userAgent, doNotTrack: data.has('doNotTrack') },
+      environment: {
+        ...env,
+        deviceType: next.deviceType,
+        mobileDevice: next.mobileDevice,
+        browserPreset: next.browserPreset,
+        acceptLanguage: next.acceptLanguage,
+        userAgent: next.userAgent,
+        doNotTrack: data.has('doNotTrack'),
+      },
       autoLogin: {
         ...login,
         enabled: data.has('autoLogin'),
@@ -246,8 +494,13 @@ function editAccount() {
       },
       ...(next.password ? { password: next.password } : {}),
     });
-    showToast('配置已保存；运行中的账户重启后完整生效');
+    const applied = await api.applyEnvironment(account.id);
+    showToast(applied.running
+      ? `配置已保存；已切换为${applied.label}并自动刷新`
+      : '配置已保存；下次打开账户时应用设备环境');
   });
+  bindAvatarPicker();
+  bindUserAgentFields();
 }
 
 function openAppSettings() {
@@ -255,7 +508,7 @@ function openAppSettings() {
   openEditor('软件安全与快捷键', [
     checkField('启动密码', 'launchPasswordEnabled', appSettings.launchPasswordEnabled, '启用后，下次打开软件必须先输入密码；锁定前不会加载账户会话'),
     field('当前启动密码', 'currentPassword', '', 'password', `placeholder="${appSettings.launchPasswordEnabled ? '修改设置时必须输入' : '尚未启用'}" autocomplete="current-password"`),
-    field('新启动密码', 'newPassword', '', 'password', `placeholder="${appSettings.launchPasswordEnabled ? '留空保留原密码' : '启用时至少8位'}" autocomplete="new-password"`),
+    field('新启动密码', 'newPassword', '', 'password', `placeholder="${appSettings.launchPasswordEnabled ? '留空保留原密码' : '启用时至少4位'}" minlength="4" autocomplete="new-password"`),
     field('显示/隐藏窗口', 'showHide', shortcuts.showHide),
     field('下一个账户', 'nextAccount', shortcuts.nextAccount),
     field('上一个账户', 'previousAccount', shortcuts.previousAccount),
@@ -264,8 +517,8 @@ function openAppSettings() {
     field('同时运行上限', 'maxRunningAccounts', appSettings.maxRunningAccounts || 8, 'number', 'min="1" max="30" required'),
     field('闲置自动停止', 'idleStopMinutes', appSettings.idleStopMinutes ?? 30, 'number', 'min="0" max="1440" required'),
     '<span></span><span class="hint">单位：分钟；0表示关闭。只停止非当前账户，释放隐藏浏览进程；超过运行上限时优先停止最久未使用账户。</span>',
-    field('内存软上限(MB)', 'memoryLimitMb', appSettings.memoryLimitMb || 4096, 'number', 'min="1024" max="32768" step="256" required'),
-    '<span></span><span class="hint">达到软上限时逐个停止最久未使用的后台账户；不会突然终止当前操作中的账户。</span>',
+    field('内存提醒阈值(MB)', 'memoryLimitMb', appSettings.memoryLimitMb || 4096, 'number', 'min="1024" max="32768" step="256" required'),
+    '<span></span><span class="hint">达到阈值时仅显示提醒，不会因为内存或CPU过高自动关闭账户窗口。</span>',
     `<label for="field-dataDirectoryDisplay">数据文件目录</label><div class="path-row"><input id="field-dataDirectoryDisplay" value="${escapeHtml(appSettings.dataDirectory || '')}" readonly><button type="button" data-choose-data-directory>选择</button><input type="hidden" name="dataBaseDirectory" value=""></div>`,
     `<label>本地操作日志</label><div class="path-row"><input value="${escapeHtml(appSettings.logDirectory || '')}" readonly><button type="button" data-open-log-directory>打开</button></div>`,
     '<span></span><span class="hint">记录添加、删除、清理、快照、导入导出和设置变更；保留90天，单文件最多5MB，不记录密码内容。</span>',
@@ -572,6 +825,23 @@ $('#import-package').addEventListener('click', async () => {
 
 api.onState(refreshWorkspace);
 api.onBrowserEvent((event) => {
+  if (event.type === 'resource-usage') {
+    const cpu = Math.round(Number(event.systemCpuPercent) || 0);
+    const memory = Math.round(Number(event.systemMemoryPercent) || 0);
+    const appMemory = Math.round(Number(event.appMemoryMb) || 0);
+    const usage = $('#resource-usage');
+    usage.textContent = `CPU ${cpu}% · 内存 ${memory}% · 本应用 ${appMemory} MB`;
+    usage.title = `系统CPU ${cpu}% · 系统内存 ${memory}% · ProfileDesk内存 ${appMemory} MB · 运行账户 ${Number(event.runningAccounts) || 0}`;
+    return;
+  }
+  if (event.type === 'resource-warning') {
+    showToast(`资源占用提醒：${(event.reasons || []).join('；')}。不会自动关闭当前窗口。`, true);
+    return;
+  }
+  if (event.type === 'environment-warning') {
+    showToast(event.reason || '当前系统无法应用移动设备模拟，已回退为普通窗口', true);
+    return;
+  }
   if (event.type === 'activated') {
     activeAccountId = event.accountId;
     renderTree();
@@ -580,7 +850,6 @@ api.onBrowserEvent((event) => {
   if (event.type === 'resource-released') {
     const messages = {
       idle: '闲置账户已自动停止并释放资源',
-      memory: '内存达到软上限，已停止最久未使用的后台账户',
       limit: '已停止最久未使用账户以控制资源占用',
     };
     showToast(messages[event.reason] || '后台账户已停止并释放资源');
@@ -604,7 +873,7 @@ api.onAppShortcut((event) => {
 });
 
 new ResizeObserver(requestBrowserBounds).observe($('#browser-stage'));
-window.addEventListener('resize', requestBrowserBounds);
+window.addEventListener('resize', () => updateSidebarState({ persist: false }));
 document.querySelectorAll('dialog').forEach((dialog) => dialog.addEventListener('close', requestBrowserBounds));
 $('#editor-dialog').addEventListener('close', () => {
   $('#editor-fields').replaceChildren();
@@ -632,9 +901,14 @@ $('#lock-form').addEventListener('submit', async (event) => {
 });
 
 async function initialize() {
+  bindSidebarResizer();
   updateSidebarState();
   const bootstrap = await api.getBootstrap();
   appSettings = bootstrap.settings;
+  if (bootstrap.safeMode) {
+    setBusy('安全模式：已跳过账户自动恢复并关闭硬件加速');
+    showToast('当前以安全模式启动，可先检查账户设置后再正常重启');
+  }
   if (bootstrap.locked) {
     $('#lock-dialog').showModal();
     requestBrowserBounds();

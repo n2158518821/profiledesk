@@ -22,6 +22,47 @@ const { DataDirectoryService } = require('./data-directory-service');
 
 app.commandLine.appendSwitch('force-webrtc-ip-handling-policy', 'disable_non_proxied_udp');
 
+let safeMode = process.argv.includes('--safe-mode');
+let startupComplete = false;
+let fatalDialogShown = false;
+
+function startupLog(phase, error = null) {
+  try {
+    const directory = app.getPath('userData');
+    fs.mkdirSync(directory, { recursive: true });
+    const file = path.join(directory, 'startup.log');
+    const stat = fs.existsSync(file) ? fs.statSync(file) : null;
+    if (stat?.size > 1024 * 1024) {
+      fs.rmSync(`${file}.previous`, { force: true });
+      fs.renameSync(file, `${file}.previous`);
+    }
+    const detail = error
+      ? String(error?.stack || error?.message || error).replace(/[\r\n]+/g, ' | ').slice(0, 8000)
+      : '';
+    fs.appendFileSync(file, `${new Date().toISOString()} ${phase}${detail ? ` ${detail}` : ''}\n`, 'utf8');
+    return file;
+  } catch {
+    return '';
+  }
+}
+
+function startupMarkerFile() {
+  return path.join(app.getPath('userData'), 'startup-in-progress');
+}
+
+function showFatalError(error) {
+  const logFile = startupLog('FATAL', error);
+  console.error('ProfileDesk fatal error:', error);
+  if (fatalDialogShown) return;
+  fatalDialogShown = true;
+  const message = [
+    String(error?.message || error || '未知启动错误'),
+    logFile ? `\n错误日志：${logFile}` : '',
+    '\n可在命令行添加 --safe-mode 启动，跳过账户恢复和设备模拟。',
+  ].join('');
+  try { dialog.showErrorBox('ProfileDesk 启动失败', message); } catch {}
+}
+
 let mainWindow;
 let store;
 let vault;
@@ -219,6 +260,7 @@ function registerIpc() {
 
   ipcMain.handle('app:get-bootstrap', () => ({
     locked: !isUnlocked,
+    safeMode,
     settings: publicAppSettings(),
   }));
   ipcMain.handle('app:unlock', async (_event, password) => {
@@ -373,6 +415,11 @@ function registerIpc() {
   handleUnlocked('browser:activate', (_event, id) => profiles.activate(id));
   handleUnlocked('browser:navigate', (_event, id, url) => profiles.navigate(id, url));
   handleUnlocked('browser:command', (_event, id, command) => profiles.command(id, command));
+  handleUnlocked('browser:apply-environment', async (_event, id) => {
+    const result = profiles.applyEnvironment(id, { reload: true });
+    await logAction('account.environment_applied', { accountId: id, device: result.device });
+    return result;
+  });
   handleUnlocked('browser:set-bounds', (_event, bounds) => profiles.setBounds(assertObject(bounds)));
   handleUnlocked('browser:set-proxy', async (_event, id, proxy) => {
     const result = await profiles.applyProxy(id, proxy);
@@ -504,7 +551,11 @@ function registerIpc() {
       if (entry.cookies.length > 10000) throw new Error('单个账户Cookie数量异常');
       const oldSite = payload.sites.find((site) => site.id === entry.account.siteId);
       let site = store.data.sites.find((item) => item.name === oldSite?.name);
-      if (!site) site = await store.addSite({ name: oldSite?.name || '已导入业务站', homeUrl: oldSite?.homeUrl || entry.account.startUrl });
+      if (!site) site = await store.addSite({
+        name: oldSite?.name || '已导入业务站',
+        homeUrl: oldSite?.homeUrl || entry.account.startUrl,
+        color: oldSite?.color,
+      });
       const account = await store.addAccount({
         ...entry.account,
         id: undefined,
@@ -539,10 +590,17 @@ function registerIpc() {
   });
 }
 
-app.whenReady().then(async () => {
+async function startApplication() {
+  const marker = startupMarkerFile();
+  if (!safeMode && fs.existsSync(marker)) safeMode = true;
+  fs.mkdirSync(path.dirname(marker), { recursive: true });
+  fs.writeFileSync(marker, `${new Date().toISOString()}\n`, 'utf8');
+  startupLog(`START version=${app.getVersion()} safeMode=${safeMode}`);
   Menu.setApplicationMenu(null);
+  startupLog('PHASE data-directory');
   dataDirectories = new DataDirectoryService(app.getPath('userData'));
   rootDir = await dataDirectories.init();
+  startupLog('PHASE local-services');
   store = new WorkspaceStore(rootDir);
   vault = new SecretVault(rootDir, safeStorage);
   settings = new SettingsService(rootDir);
@@ -550,12 +608,14 @@ app.whenReady().then(async () => {
   await Promise.all([store.init(), vault.init(), settings.init(), audit.init()]);
   await logAction('app.started', { version: app.getVersion(), dataDirectory: rootDir });
   isUnlocked = !settings.isLockedOnLaunch();
+  startupLog('PHASE main-window');
   createMainWindow();
   profiles = new ProfileManager({
     mainWindow,
     store,
     vault,
     rootDir,
+    safeMode,
     onEvent: (event) => {
       send('browser:event', event);
       if (['started', 'stopped', 'crashed', 'navigation'].includes(event.type)) {
@@ -570,16 +630,32 @@ app.whenReady().then(async () => {
       }
     },
   });
+  startupLog('PHASE browser-manager');
   await profiles.init();
   await profiles.updateResourceLimits(settings.publicSettings());
   snapshots = new SnapshotService(rootDir, store, vault);
   await snapshots.init();
   registerIpc();
   registerGlobalShortcuts();
+  startupLog('PHASE renderer');
   await mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   mainWindow.once('ready-to-show', () => mainWindow.show());
   if (!mainWindow.isVisible()) mainWindow.show();
-  if (isUnlocked) await restorePreviousSessions();
+  if (isUnlocked && !safeMode) {
+    startupLog('PHASE restore-sessions');
+    await restorePreviousSessions();
+  }
+  startupComplete = true;
+  startupLog('READY');
+  fs.rmSync(marker, { force: true });
+}
+
+if (!safeMode && fs.existsSync(startupMarkerFile())) safeMode = true;
+if (safeMode) app.disableHardwareAcceleration();
+
+app.whenReady().then(startApplication).catch((error) => {
+  showFatalError(error);
+  app.exit(1);
 });
 
 app.on('window-all-closed', () => {
@@ -589,5 +665,14 @@ app.on('window-all-closed', () => {
 app.on('will-quit', () => globalShortcut.unregisterAll());
 
 process.on('uncaughtException', (error) => {
+  startupLog(startupComplete ? 'UNCAUGHT' : 'STARTUP-UNCAUGHT', error);
   console.error('Uncaught exception:', error.message);
+  if (!startupComplete) showFatalError(error);
+});
+
+process.on('unhandledRejection', (reason) => {
+  const error = reason instanceof Error ? reason : new Error(String(reason));
+  startupLog(startupComplete ? 'UNHANDLED-REJECTION' : 'STARTUP-REJECTION', error);
+  console.error('Unhandled rejection:', error.message);
+  if (!startupComplete) showFatalError(error);
 });

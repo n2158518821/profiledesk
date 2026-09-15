@@ -113,7 +113,7 @@ class SettingsService {
       throw new Error('当前启动密码不正确');
     }
     if (enablePassword && (!this.data.launchPassword.enabled || newPassword)) {
-      if (newPassword.length < 8) throw new Error('新启动密码至少需要8个字符');
+      if (newPassword.length < 4) throw new Error('新启动密码至少需要4个字符');
       const salt = crypto.randomBytes(16);
       this.data.launchPassword = {
         enabled: true,

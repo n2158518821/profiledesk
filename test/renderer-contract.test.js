@@ -24,3 +24,52 @@ test('every preload invoke channel has a main-process handler', () => {
   ]);
   assert.deepEqual([...invoked].filter((channel) => !handled.has(channel)), []);
 });
+
+test('resource pressure warns instead of closing accounts for memory usage', () => {
+  const profileManager = fs.readFileSync(path.join(root, 'src/main/profile-manager.js'), 'utf8');
+  const renderer = fs.readFileSync(path.join(root, 'src/renderer/app.js'), 'utf8');
+  assert.match(profileManager, /this\.emit\('resource-warning'/);
+  assert.doesNotMatch(profileManager, /reason:\s*'memory'/);
+  assert.match(renderer, /event\.type === 'resource-usage'/);
+});
+
+test('sidebar has a bounded drag handle and mobile environments use a stable responsive viewport', () => {
+  const html = fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8');
+  const renderer = fs.readFileSync(path.join(root, 'src/renderer/app.js'), 'utf8');
+  const profileManager = fs.readFileSync(path.join(root, 'src/main/profile-manager.js'), 'utf8');
+  assert.match(html, /id="sidebar-resizer"/);
+  assert.match(renderer, /SIDEBAR_MIN_WIDTH = Math\.ceil\(SIDEBAR_AVATAR_SIZE \* 1\.5\) \+ 14/);
+  assert.match(renderer, /pointermove/);
+  assert.doesNotMatch(profileManager, /enableDeviceEmulation/);
+  assert.doesNotMatch(profileManager, /disableDeviceEmulation/);
+  assert.match(profileManager, /MOBILE_DEVICE_PROFILES/);
+  assert.match(profileManager, /Math\.min\(this\.bounds\.width, profile\.width\)/);
+});
+
+test('Windows startup failures are visible and can recover through safe mode', () => {
+  const main = fs.readFileSync(path.join(root, 'src/main/main.js'), 'utf8');
+  const profileManager = fs.readFileSync(path.join(root, 'src/main/profile-manager.js'), 'utf8');
+  const debugScript = fs.readFileSync(path.join(root, 'run-windows-debug.cmd'), 'utf8');
+  assert.match(main, /startup\.log/);
+  assert.match(main, /startup-in-progress/);
+  assert.match(main, /--safe-mode/);
+  assert.match(main, /showErrorBox\('ProfileDesk 启动失败'/);
+  assert.match(main, /disableHardwareAcceleration/);
+  assert.match(main, /\.catch\(\(error\) => \{/);
+  assert.match(profileManager, /this\.safeMode/);
+  assert.match(profileManager, /this\.safeMode/);
+  assert.match(debugScript, /win-unpacked\\ProfileDesk\.exe/);
+  assert.match(debugScript, /--safe-mode --enable-logging/);
+});
+
+test('Windows build launcher always pauses and writes a persistent build log', () => {
+  const command = fs.readFileSync(path.join(root, 'build-windows.cmd'), 'utf8');
+  const powershell = fs.readFileSync(path.join(root, 'build-windows.ps1'), 'utf8');
+  assert.match(command, /powershell\.exe .*build-windows\.ps1/);
+  assert.match(command, /pause >nul/);
+  assert.match(command, /build-windows\.log/);
+  assert.match(powershell, /Start-Transcript/);
+  assert.match(powershell, /npm\.cmd install --allow-git=all/);
+  assert.match(powershell, /npm\.cmd run dist:win/);
+  assert.match(powershell, /exit \$exitCode/);
+});

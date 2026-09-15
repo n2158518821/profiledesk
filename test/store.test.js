@@ -21,6 +21,26 @@ test('workspace persists sites, isolated accounts and restore IDs', async (t) =>
   assert.equal(reloaded.publicState().accounts[0].status, 'stopped');
 });
 
+test('workspace persists account avatars and browser environment presets', async (t) => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'profiledesk-avatar-'));
+  t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));
+  const store = new WorkspaceStore(directory);
+  await store.init();
+  const site = await store.addSite({ name: 'Business', homeUrl: 'https://example.com', color: 'green' });
+  const avatarDataUrl = 'data:image/webp;base64,UklGRg==';
+  const account = await store.addAccount({ siteId: site.id, name: 'Mobile', avatarDataUrl });
+  await store.updateAccount(account.id, {
+    environment: { deviceType: 'mobile', mobileDevice: 'iphone-17-pro', browserPreset: 'chrome' },
+  });
+  const reloaded = new WorkspaceStore(directory);
+  await reloaded.init();
+  assert.equal(reloaded.data.sites[0].color, 'green');
+  assert.equal(reloaded.data.accounts[0].avatarDataUrl, avatarDataUrl);
+  assert.equal(reloaded.data.accounts[0].environment.deviceType, 'mobile');
+  assert.equal(reloaded.data.accounts[0].environment.mobileDevice, 'iphone-17-pro');
+  assert.equal(reloaded.data.accounts[0].environment.browserPreset, 'chrome');
+});
+
 test('batch import enforces the maximum row count', async (t) => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'profiledesk-limit-'));
   t.after(() => fs.promises.rm(directory, { recursive: true, force: true }));

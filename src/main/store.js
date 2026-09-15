@@ -3,6 +3,7 @@ const path = require('node:path');
 const {
   createAccount,
   createSite,
+  normalizeAvatarDataUrl,
   normalizeAutoLogin,
   normalizeEnvironment,
   normalizeProxy,
@@ -99,7 +100,11 @@ class WorkspaceStore {
       let site = sites.find((item) => item.name === siteName);
       if (!site) {
         if (!row.homeUrl && !row.startUrl) throw new Error(`业务站“${siteName}”缺少地址`);
-        site = createSite({ name: siteName, homeUrl: row.homeUrl || row.startUrl });
+        site = createSite({
+          name: siteName,
+          homeUrl: row.homeUrl || row.startUrl,
+          color: row.siteColor || row.color,
+        });
         sites.push(site);
         sitesAdded += 1;
       }
@@ -126,14 +131,15 @@ class WorkspaceStore {
   async updateAccount(id, patch) {
     const account = this.findAccount(id);
     if (!account) throw new Error('账户不存在');
-    const allowed = ['name', 'username', 'startUrl', 'currentUrl', 'note', 'tags', 'proxy', 'environment', 'autoLogin', 'status', 'lastError', 'lastOpenedAt'];
+    const allowed = ['name', 'avatarDataUrl', 'username', 'startUrl', 'currentUrl', 'note', 'tags', 'proxy', 'environment', 'autoLogin', 'status', 'lastError', 'lastOpenedAt'];
     for (const key of allowed) {
       if (!Object.hasOwn(patch, key)) continue;
       if (key === 'name') {
         const name = String(patch.name || '').trim().slice(0, 80);
         if (!name) throw new Error('账户名称不能为空');
         account.name = name;
-      } else if (key === 'username') account.username = String(patch.username || '').trim().slice(0, 300);
+      } else if (key === 'avatarDataUrl') account.avatarDataUrl = normalizeAvatarDataUrl(patch.avatarDataUrl);
+      else if (key === 'username') account.username = String(patch.username || '').trim().slice(0, 300);
       else if (key === 'startUrl' || key === 'currentUrl') account[key] = normalizeUrl(patch[key]);
       else if (key === 'proxy') account.proxy = normalizeProxy({ ...account.proxy, ...patch.proxy });
       else if (key === 'environment') account.environment = normalizeEnvironment({ ...account.environment, ...patch.environment });
